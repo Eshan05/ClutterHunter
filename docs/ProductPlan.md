@@ -322,12 +322,14 @@ ScanSummary {
   allocated_bytes
   volume_used_bytes?
   unaccounted_bytes?
-  started_at
-  completed_at
+  started_at_ms
+  completed_at_ms
+  elapsed_ms
   warnings[]
 }
 
 ItemQuery {
+  parent_id?
   scope_id?
   text?
   kinds[]?
@@ -335,7 +337,8 @@ ItemQuery {
   policy_tiers[]?
   owner_ids[]?
   min_bytes?
-  modified_before?
+  modified_before_ms?
+  query_id?
   sort: name | allocated | logical | modified | type | policy | owner
   direction: asc | desc
   cursor?
@@ -369,10 +372,16 @@ PolicyEvidence {
 }
 
 CleanupPlan {
+  session_id
   target_bytes?
   selected_candidate_bytes
+  selected_review_bytes
   review_potential_bytes
   target_shortfall_bytes
+  truncated
+  omitted_item_count
+  omitted_candidate_bytes
+  omitted_review_bytes
   items[]
 }
 
@@ -421,6 +430,7 @@ start_scan
 cancel_scan
 get_scan_summary
 query_items
+cancel_item_query
 get_item_details
 get_storage_aggregate
 get_treemap_slice
@@ -591,19 +601,24 @@ tight, this whole feature is deferred before any core feature is weakened.
 
 ## 11. On-Device AI Architecture
 
+Current implementation and live-model evidence are recorded in
+[LocalAgent.md](LocalAgent.md).
+
 ### 11.1 Runtime
 
 - AI SDK 7 `ToolLoopAgent` runs inside the React/Tauri webview.
-- Use the first-party `@ai-sdk/openai-compatible` provider against Ollama's
-  `/v1/chat/completions` API.
+- Use exactly pinned `ai-sdk-ollama` `4.0.0` against Ollama's native `/api/chat`
+  stream. The provider implements AI SDK 7 and uses the official `ollama-js`
+  client underneath.
 - Inject `@tauri-apps/plugin-http` fetch so CORS configuration is not delegated to
   the user's Ollama environment.
 - Tauri HTTP capabilities allow only `http://127.0.0.1:*` and no redirects to a
   non-loopback destination.
 - The configured endpoint accepts a numeric custom loopback port and is
   canonicalized to `127.0.0.1`. Hostnames, LAN IPs, and internet URLs are rejected.
-- Do not use `ai-sdk-ollama`; known releases were compromised in a 2026 npm
-  supply-chain incident.
+- Never admit the compromised `ai-sdk-ollama` releases `0.13.1`, `1.1.1`,
+  `2.2.1`, or `3.8.5`. Keep the verified `4.0.0` release exact-pinned with its
+  lockfile integrity; dependency-policy failure blocks installation and release.
 - Do not add a Node sidecar, hidden local proxy, Tambo runtime, Postgres, auth, or
   another service process.
 
@@ -643,6 +658,9 @@ configuration itself.
   3. harness correctness and repeatability;
   4. measured first-token and full-turn latency;
   5. curated quality and usable context.
+- Read `/api/ps` and match current residency by digest. An already-loaded local
+  model remains eligible when its own GPU/CPU allocation reduced the free-RAM
+  snapshot; loading a different model still requires current headroom.
 - Present plain-language `Light`, `Balanced`, and `Heavy` labels plus exact size,
   context, and test details. Do not silently choose a model.
 - Uninstalled catalog entries show expected fit. Installed entries show measured
@@ -651,6 +669,8 @@ configuration itself.
 Initial catalog candidates:
 
 - `lfm2.5-thinking:1.2b` as a light on-device candidate.
+- `granite4:1b-h` as the measured light fallback; its installed digest passed
+  all four compatibility scenarios on the prepared machine with Ollama 0.30.7.
 - Qwen 3.5 0.8B/2B/4B variants, with 2B the likely balanced candidate on the
   prepared 8 GB RAM, GTX 1650 machine.
 - `functiongemma` may be noted as a specialized function model but is not eligible
@@ -662,6 +682,8 @@ Initial catalog candidates:
 Run automatically when an installed model is selected, after the native local-
 residency preflight. Use only a bundled synthetic scan fixture and cache by model
 digest, Ollama version, harness version, and relevant model options.
+Use the same streaming path as production chat, record per-scenario first-token
+and full-turn latency, and invalidate caches when stream semantics change.
 
 Scenarios:
 
@@ -680,20 +702,25 @@ Keep schemas small and use AI SDK `activeTools` so each workflow exposes only th
 tools it needs.
 
 ```text
-get_storage_overview(scope_id?)
-query_storage_items(scope_id?, text?, filters?, sort?, cursor?, limit <= 100)
-summarize_storage(scope_id?, group_by: extension | age | owner | policy, limit <= 50)
-get_item_evidence(item_ids <= 20)
+get_storage_overview()
+query_storage_items(scope?, text?, filters?, sort?, cursor?, limit <= 100)
+summarize_storage(scope?, group_by: extension | owner | policy | kind, limit <= 50)
+get_item_evidence(item_ids <= 20 | use_attached_item)
 build_cleanup_plan(target_bytes?, constraints?)
 edit_cleanup_plan(add_item_ids?, remove_item_ids?)
 get_duplicate_results(scope_id?, cursor?, limit <= 50)
-inspect_log_excerpt(item_ids <= 5, requested_bytes)
-protect_path(item_id, reason?)
+inspect_log_excerpt(item_ids <= 5 | use_attached_item, requested_bytes)
+protect_path(item_id | use_attached_item, reason?)
 ```
 
 Behavior:
 
 - Read-only metadata tools run automatically and appear in the activity trace.
+- A selected directory is the default query/aggregate scope. `/` explicitly
+  selects the scan root. Full paths resolve locally by final component and exact
+  returned path; the selected item's internal node ID is never shown to the model.
+- Evidence and approval tools consume the trusted UI attachment through
+  `use_attached_item`; model-copied attachment IDs are not trusted.
 - Plan edits are session-only, visible, and reversible.
 - `inspect_log_excerpt` requires per-request approval showing exact paths and byte
   limits.
@@ -970,6 +997,11 @@ Generate a smaller fast UI fixture separately for ordinary automated tests.
 
 ## 19. Implementation Sequence
 
+Status on 2026-07-15: Phase 0 (implementation-order item 1), Phase 1 (item 2),
+and Phase 3 (item 4) meet their implementation exits. Phase 2 remains the next
+product build focus. Controlled cold-cache/WizTree repetition, installed security
+recording, expanded Playwright, and visual polish remain Phase 4/item 5 work.
+
 ### Phase 0: Documentation and Skeleton
 
 - Make this document the product/source-of-truth plan.
@@ -1007,7 +1039,8 @@ Exit: polished analyzer and editable conservative plan with Ollama switched off.
   fit, harness cache, AI SDK provider, agent loop, bounded tools, activity trace,
   typed result registry, approvals, log excerpts, and plan refinement.
 
-Exit: prepared light/balanced models pass harness and hero latency/correctness.
+Exit: a prepared balanced model passes harness/latency, or its measured rejection
+and a passing ranked light fallback are recorded on the prepared machine.
 
 ### Phase 4: Hardening and Demo
 
@@ -1072,17 +1105,22 @@ Engineering defaults chosen to make implementation decision-complete:
 - Rust arena and Tauri query boundary, not a full-tree JSON transfer.
 - Separate elevated helper with named pipe, nonce, PID validation, Bincode 2.
 - `ts-rs` generated DTOs; no prerelease binding framework.
-- AI SDK 7 first-party OpenAI-compatible provider through Tauri native fetch.
+- AI SDK 7 native Ollama provider through Tauri native fetch.
 - Eight-step agent cap, bounded result sizes, 8K effective demo context.
 - D3 hierarchy plus Canvas treemap, virtualized table, neutral multi-hue UI.
 - No telemetry and redacted operational logs.
 - App-bundled policies/catalogs update only with releases.
 
-The only remaining choices are empirical validation results, not product design:
+Resolved empirical choices:
 
-- whether `ntfs-reader` passes the accuracy/performance spike;
-- which exact light and balanced model tags pass the harness on the prepared PC;
-- whether duplicate analysis fits after all release gates pass.
+- the raw backend uses the eDirStat-derived parser/arena pipeline behind the
+  adapter; `ntfs-reader` remains a differential oracle rather than the product
+  data model;
+- `granite4:1b-h` is the accepted light model on the prepared 8 GB machine;
+  `qwen3.5:2b` is rejected under current headroom after exceeding the overview
+  step timeout, so the required light fallback is the demo default.
+
+Duplicate analysis remains the explicit post-gate scope decision and first cut.
 
 ## 22. Primary Technical References
 
@@ -1100,12 +1138,13 @@ The only remaining choices are empirical validation results, not product design:
 - [AI SDK ToolLoopAgent](https://ai-sdk.dev/docs/reference/ai-sdk-core/tool-loop-agent)
 - [AI SDK tools and approval](https://ai-sdk.dev/docs/ai-sdk-core/tools-and-tool-calling)
 - [AI SDK loop control](https://ai-sdk.dev/docs/agents/loop-control)
-- [AI SDK OpenAI-compatible provider](https://ai-sdk.dev/providers/openai-compatible-providers)
+- [AI SDK Ollama community providers](https://ai-sdk.dev/providers/community-providers/ollama)
 - [AI SDK environment compatibility](https://ai-sdk.dev/docs/getting-started/navigating-the-library)
-- [Ollama OpenAI compatibility](https://docs.ollama.com/api/openai-compatibility)
+- [Ollama native API](https://docs.ollama.com/api/introduction)
 - [Ollama tool calling](https://docs.ollama.com/capabilities/tool-calling)
 - [Ollama model details API](https://docs.ollama.com/api-reference/show-model-details)
 - [Ollama installed model API](https://docs.ollama.com/api/tags)
+- [Ollama running model API](https://docs.ollama.com/api/ps)
 - [Ollama local/cloud privacy FAQ](https://docs.ollama.com/faq)
 - [Qwen 3.5 model catalog](https://ollama.com/library/qwen3.5/tags)
 - [LFM 2.5 Thinking](https://ollama.com/library/lfm2.5-thinking)

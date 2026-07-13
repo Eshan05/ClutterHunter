@@ -35,19 +35,28 @@
   - Persistent user protections can only strengthen policy and require approval when proposed through chat.
 
   On-Device Agent
-  - Use first-party @ai-sdk/openai-compatible with Tauri’s scoped native fetch, targeting only 127.0.0.1:<port>/v1. Ollama officially supports streaming and tools there. AI SDK provider
-    (https://ai-sdk.dev/providers/openai-compatible-providers), Ollama compatibility (https://docs.ollama.com/api/openai-compatibility)
-
-    harness passes.
+  - Use exact-pinned ai-sdk-ollama 4.0.0 with Tauri's scoped native fetch,
+    targeting only 127.0.0.1:<port>/api. Native `/api/chat` is required because
+    live testing found Ollama's OpenAI-compatible stream could hang before
+    headers while native streaming remained fast. Exclude the four known
+    compromised ai-sdk-ollama releases. AI SDK Ollama providers
+    (https://ai-sdk.dev/providers/community-providers/ollama), Ollama native API
+    (https://docs.ollama.com/api/introduction)
 
   - Bundle a ranked offline catalog. Rank by tool reliability, hardware headroom, context, measured latency, and curated quality.
   - Target the actual demo machine: 8 GB RAM and GTX 1650. Begin validation with approximately 1.2B “Light” and 2B “Balanced” models.
   - Tools cover overview, bounded item queries, aggregates, evidence, deterministic plan generation/editing, completed duplicate results, approved log excerpts, and protected-path
+  - A selected directory is trusted UI context and becomes the default query scope. The model receives its path and policy, not its scan-local node ID; evidence and approvals bind to the trusted attachment internally.
   - Log inspection is limited to approved known text logs, exact displayed paths, and strict byte limits; content cannot affect safety classification.
   - Hide raw reasoning. Show tool name, purpose, result count, timing, approval state, and errors.
   - Bound loops to eight steps, cap tool results, support cancellation, and retain only recent chat plus compact session summaries.
 
   Implementation Order
+
+  Status on 2026-07-15: items 1, 2, and 4 are complete at their implementation
+  boundaries. Item 3 (polished no-AI analyzer/policy workflow) is next. Item 5
+  owns controlled cold-cache/WizTree repetition, packaged security recording,
+  broad Playwright/accessibility coverage, and final visual/portable-ZIP work.
 
   1. Tighten docs: product specification, v1 scope, safety policy, architecture, benchmark contract, demo script, and updated references.
   2. Scaffold the TypeScript 7/Tauri workspace and prove MFT scanning, elevated-helper isolation, fallback traversal, bindings, and the five-million-entry memory model.

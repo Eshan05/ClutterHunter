@@ -1,7 +1,7 @@
 # Scanner Spike Notes
 
-Status: scanner gates implemented in Rust; elevated differential rerun pending  
-Last updated: 2026-07-14
+Status: implementation-order item 2 complete; remaining benchmark repetition belongs to item 5 hardening  
+Last updated: 2026-07-15
 
 This file records scanner decisions and measured gaps that are too detailed for
 the product contract in [ProductPlan.md](ProductPlan.md).
@@ -19,19 +19,28 @@ the product contract in [ProductPlan.md](ProductPlan.md).
   hard-link allocation.
 - Results land in a compact contiguous arena with `u32` relationships and a
   packed name pool. The webview receives a maximum of 100 rows per query.
-- The current UI explicitly labels this backend as traversal. It does not claim
-  MFT performance or silently switch from a failed raw scan.
+- Eligible NTFS targets now select the raw MFT backend by default, matching
+  eDirStat's MFT-first behavior. A recoverable raw/UAC failure is shown before
+  the Scan control offers an explicit traversal retry; backends never switch
+  silently.
+- Raw progress streams both parsed-entry count and physical allocated bytes.
+  The allocation accumulator uses the same unnamed-data, named-stream,
+  directory, and hard-link ownership rules as final arena construction rather
+  than displaying MFT bytes read as disk usage.
 
 ## Raw NTFS Backend
 
-The Rust fast path is implemented behind the helper boundary, but is not yet
-the UI default. Its current pipeline:
+The Rust fast path is implemented behind the helper boundary and is the default
+for eligible NTFS targets. Its current pipeline:
 
-1. creates a random per-scan named pipe whose ACL grants only the current
-   Windows user, then launches the narrow helper through the `runas` verb;
+1. creates separate random per-scan data and cancellation pipes whose ACLs grant
+   only the current Windows user, then launches the narrow helper through the
+   `runas` verb;
 2. verifies the connected pipe client PID plus a protocol-version, nonce,
    helper-PID, and target handshake before accepting scan data;
-3. reads the NTFS boot sector and `$MFT` data-run map from the raw volume;
+3. opens the direct DOS volume path with eDirStat's proven sharing and sequential
+   non-buffered flags, plus a separate buffered handle for the NTFS boot sector,
+   `$MFT` data-run map, and journal queries;
 4. overlaps four reusable, 4096-byte-aligned 4 MiB reads with parallel record
    parsing while reusing the validated raw-volume handle;
 5. applies update-sequence fixups and parses resident/non-resident attributes;
@@ -42,11 +51,13 @@ the UI default. Its current pipeline:
    directory aggregation, then streams bounded sequenced node/name frames;
 9. validates frame sizes, ordering, declared counts, UTF-8 names, hierarchy links,
    and parent cycles before adopting the arena directly in `clutter-core`; and
-10. captures bounded USN journal positions before and after enumeration, marks a
-    changed journal as potentially stale, and records exact arena/process memory
-    diagnostics; and
-11. streams live MFT progress and sends cooperative cancellation back over the
-    same authenticated duplex pipe.
+10. captures bounded USN journal positions through duplicates of the metadata
+    handle before and after enumeration, marks a changed journal as
+    potentially stale, and records exact arena/process memory diagnostics;
+11. streams live MFT progress while cooperative cancellation travels over its own
+    authenticated pipe, avoiding synchronous duplex-handle serialization; and
+12. cancels synchronous Windows I/O after 15 seconds without progress, retains a
+    termination fallback, and bounds the host's helper-exit wait.
 
 The application path no longer writes a temporary scan snapshot. The helper's
 `snapshot` and `inspect` commands remain as explicit diagnostic tools for frozen
@@ -58,25 +69,70 @@ both development and release builds.
 
 ## Current Measurement
 
-One optimized warm-cache smoke run on the current `C:` volume on 2026-07-14
-produced:
+The accepted optimized warm-cache smoke run on the current `C:` volume after the
+reboot on 2026-07-14 produced:
 
-- 7,281,764 adopted entries;
-- helper raw scan and arena finalization: 8.010 seconds;
-- named-pipe transfer, strict validation, and direct core arena adoption included:
-  11.57 seconds for the complete Rust smoke-test body; and
-- 464,675,604,328 allocated bytes indexed.
+- 6,146,048 MFT slots and 6,293,553,152 MFT bytes read;
+- 7,299,752 adopted entries;
+- helper raw scan and arena finalization: 6.820 seconds;
+- named-pipe transfer: 1.292 seconds; direct core adoption: 0.601 seconds;
+- 9.66 seconds for the complete Rust smoke-test body;
+- 472,736,309,248 allocated bytes indexed;
+- 620,160,659 bytes of final arena capacity;
+- lifetime peaks of 1,133,899,776 helper bytes and 656,871,424 host bytes; and
+- a sampled concurrent helper-plus-host peak of 1,275,105,280 bytes.
 
-The user's nearby WizTree observation was 21.00 seconds for its displayed scan
-completion, followed by additional time before all files and the treemap appeared.
-These numbers are encouraging but are not a benchmark result: both are single,
-uncontrolled runs, cache and system load differ, and ClutterHunter's measurement
-does not yet include policy classification or the first interactive analyzer
-view. Analyzer classification and bounded first-query measurements are now in
-[AnalyzerCore.md](AnalyzerCore.md). The release gate remains median cold/warm runs
-against the same volume and the same usable-view endpoint. A fresh elevated run
-after the laptop reboot was not claimed: the manual helper remained at the Windows
-elevation boundary while Computer Use was unavailable.
+The helper owner table is now independently releasable chunks rather than one
+monolithic allocation. Owner paths use packed 16-byte links and shared name bytes
+instead of millions of inline `String`/`SmallVec` values. Finalization compacts
+only accepted names into an exact-capacity arena and releases source chunks as it
+progresses. Compared with the initial accepted post-reboot run, helper peak fell
+from 1.92 GB to 1.13 GB and complete smoke time fell from 10.52 to 9.66 seconds.
+The measured 7.30-million-entry concurrent peak scales to about 873 MB at the
+five-million-entry contract target, before the helper exits.
+
+The warm usable-view benchmark now includes raw scan, ownership/policy
+classification, stable coverage/totals, and the first 50-row analyzer query. Its
+three runs were 18.484, 18.074, and 18.035 seconds, for an 18.074-second median;
+the bounded first query was below the millisecond timer and real-session Rust
+state was about 664 MB at 7.30 million entries. The user's nearby WizTree
+observation was 21.00 seconds for displayed scan completion, followed by more time
+before all files and the treemap appeared. This is useful trajectory evidence,
+not a controlled product comparison: a same-session WizTree capture and three
+cold-cache ClutterHunter runs remain required.
+
+After enabling the raw backend in the release UI on 2026-07-15, the user's next
+real `C:` scan reported 6,941,824 items, 440.4 GB allocated, and 19.6 seconds to
+the populated analyzer view. The nearby WizTree observation was 21.00 seconds
+to its scan-complete indicator and still needed additional population time.
+This confirms the UI was previously timing traversal rather than the implemented
+fast path; it remains an observational comparison until the controlled
+three-run cold/warm protocol is completed.
+
+Protocol v10 then added running physical-allocation progress using the same
+unnamed-stream, named-stream, directory, and hard-link ownership rules as final
+aggregation. The user confirmed that both Items and Allocated now advance during
+a real MFT scan; the final totals remain authoritative.
+
+The reboot-only hold was not a raw-volume `CreateFile` failure. The helper had
+duplicated one synchronous duplex named-pipe handle: a blocking cancellation read
+could serialize a progress write on the shared Windows pipe object, which also
+prevented the watchdog from reporting. Separate data and cancellation pipe
+instances removed that race. The elevated raw-versus-traversal fixture now passes
+resident/non-resident, sparse, compressed, hard-link, alternate-stream, Unicode,
+reparse, zero-byte, and concurrently changing-file checks. Its accepted warm run
+finished in 8.67 seconds. Sparse/compressed physical allocation now uses the NTFS
+compressed-size field rather than the reserved-allocation field.
+
+The synthetic analyzer gate remains healthy independently: five million entries
+reached the first bounded search in 200 ms with 390,000,065 bytes of modeled
+first-view Rust state. Current-machine ownership discovery passed for 275 roots.
+The full Rust workspace, warning-denied clippy, TypeScript/Vite production build,
+and Tauri release build pass. Protocol v10 adds physical allocation to bounded
+progress frames and rebuilds both host and helper. MSI/NSIS archive acceptance
+must be repeated for this wire revision. Windows Graphics Capture still fails
+with `SetIsBorderRequired ... 0x80004002`; ShareX screenshots and accessibility
+state provide current visual evidence instead.
 
 ## eDirStat Reuse
 
@@ -110,9 +166,9 @@ not provide the complete allocation/hard-link/alternate-stream model required by
 the product contract. It remains behind the helper boundary and can be replaced
 without changing public DTOs.
 
-## Required Differential Fixtures
+## Differential Fixtures
 
-Before enabling `RawNtfsBackend` in the UI, compare eDirStat-derived parsing,
+Validation before enabling `RawNtfsBackend` compared eDirStat-derived parsing,
 `ntfs-reader`, Win32 metadata, and traversal on fixtures containing:
 
 1. resident and non-resident data;
@@ -128,15 +184,25 @@ Before enabling `RawNtfsBackend` in the UI, compare eDirStat-derived parsing,
 
 Frozen MFT records now cover resident/non-resident data, sparse/compressed-style
 allocation, hard links, named streams, attribute lists, fixups, Unicode, corrupt
-records, and subtree rebasing. An ignored elevated folder fixture compares raw and
-traversal totals and hierarchy on the same generated tree. The five-million-entry
-arena gate measured `340,000,059` bytes and `523` ms adoption.
+records, and subtree rebasing. Named-stream logical and allocated bytes are now
+included in the owning file totals rather than only counted diagnostically. The
+ignored elevated folder fixture creates resident/non-resident, sparse, compressed,
+hard-link, alternate-stream, Unicode, reparse, zero-byte, and mutating-file cases,
+then compares raw and traversal totals and hierarchy. It passes on the current
+real NTFS volume. The five-million-entry arena gate measured `340,000,059` bytes
+and `523` ms adoption.
 
-Raw mode is enabled in the UI only after the ignored real-volume fixture and
-controlled cold/warm benchmark are rerun successfully. UAC launch, restricted
-named-pipe transport, nonce/PID validation, bounded Bincode frames, live progress,
-USN staleness fields, packaged sidecar staging, cooperative pipe cancellation,
-and stable decline/helper-failure codes are present.
+Raw mode is enabled by default for eligible NTFS targets after the warm memory,
+usable-view, differential-fixture, and release-UI trajectories passed. UAC launch,
+isolated restricted named-pipe transport,
+nonce/PID validation, bounded Bincode frames, live progress, USN staleness fields,
+packaged sidecar staging, cooperative cancellation, synchronous-I/O cancellation,
+stall termination, concurrent memory sampling, and stable decline/helper-failure
+codes are present. The protocol-v10 release, MSI, and NSIS builds pass; MSI
+extraction reproduces the staged helper byte-for-byte with SHA-256
+`a2ae1b262c9ecad5dfe619b96076a60ff6b6291657344bcfe931325741a1c5fd`.
+Three controlled cold-cache runs and a same-session WizTree repetition remain
+item 5 benchmark evidence; they are not scanner implementation gaps.
 
 ## Owner-Native Cleanup
 
