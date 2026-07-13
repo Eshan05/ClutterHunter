@@ -1,0 +1,32 @@
+[workspace]
+members = [
+  "crates/clutter-core",
+  "crates/clutter-protocol",
+  "crates/clutter-scanner-helper",
+]
+resolver = "3"
+
+[package]
+name = "clutterhunter"
+version = "0.1.0"
+description = "A private, evidence-based storage agent for Windows"
+authors = ["ClutterHunter contributors"]
+edition = "2024"
+rust-version = "1.85"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+name = "clutterhunter_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+clutter-core = { path = "crates/clutter-core" }
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
