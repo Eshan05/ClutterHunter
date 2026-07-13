@@ -541,6 +541,32 @@ Label exact registry/package matches as facts. Label root/name heuristics as
 inference. Late or heuristic ownership may improve explanation but cannot promote
 an item to `cleanup_candidate` after scan completion.
 
+### 9.1 Owner-Native Actions
+
+The first milestone remains proposal-only, but plan items must identify the
+correct future action boundary. ClutterHunter hardcodes reviewed ownership and
+disposal evidence; it does not hardcode arbitrary path deletion as a substitute
+for an application's supported lifecycle.
+
+- Ollama models use `ollama rm <model>`. Never delete content-addressed blob or
+  manifest files directly because blobs may be shared by multiple model tags.
+- Scoop applications use `scoop uninstall`; old installed versions use
+  `scoop cleanup`; its download cache uses `scoop cache`. Never remove Scoop's
+  version, `current`, shim, or persisted-data directories behind Scoop's back.
+- AppX/MSIX and registered Win32 applications open Windows Apps settings or the
+  exact registered uninstaller rather than deleting their install directory.
+- Windows-managed storage opens the relevant Windows Storage/cleanup surface.
+- Only narrowly allowlisted caches, temporary data, logs, and crash reports may
+  eventually receive a direct recycle/delete action after revalidation.
+- Unknown, heuristic, protected, or user-owned paths expose inspect/open actions
+  only.
+
+Future executable actions are typed adapters with exact arguments, an ownership
+proof, a byte estimate, a preview, and explicit approval. No adapter accepts an
+arbitrary command or model-authored shell string. Example action kinds include
+`run_ollama_rm`, `run_scoop_cleanup`, `run_scoop_cache`,
+`open_windows_apps_settings`, `open_location`, and `none`.
+
 ## 10. Duplicate Analysis
 
 Duplicate analysis is not part of the initial MFT scan and is not an autonomous
