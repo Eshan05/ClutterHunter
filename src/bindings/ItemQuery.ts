@@ -4,4 +4,4 @@ import type { ItemSort } from "./ItemSort";
 import type { PolicyTier } from "./PolicyTier";
 import type { SortDirection } from "./SortDirection";
 
-export type ItemQuery = { parent_id: string | null, scope_id?: string, text?: string, kinds?: Array<ItemKind>, extensions?: Array<string>, policy_tiers?: Array<PolicyTier>, owner_ids?: Array<string>, min_bytes?: string, modified_before_ms?: string, sort: ItemSort, direction: SortDirection, cursor: string | null, limit: number, };
+export type ItemQuery = { parent_id: string | null, scope_id?: string, text?: string, kinds?: Array<ItemKind>, extensions?: Array<string>, policy_tiers?: Array<PolicyTier>, owner_ids?: Array<string>, min_bytes?: string, modified_before_ms?: string, query_id?: string, sort: ItemSort, direction: SortDirection, cursor: string | null, limit: number, };

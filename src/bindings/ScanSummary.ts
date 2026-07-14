@@ -4,4 +4,4 @@ import type { ScanCoverage } from "./ScanCoverage";
 import type { ScanTarget } from "./ScanTarget";
 import type { ScanWarning } from "./ScanWarning";
 
-export type ScanSummary = { session_id: string, target: ScanTarget, backend: ScanBackend, coverage: ScanCoverage, entry_count: string, logical_bytes: string, allocated_bytes: string, volume_used_bytes: string | null, unaccounted_bytes: string | null, elapsed_ms: string, warnings: Array<ScanWarning>, };
+export type ScanSummary = { session_id: string, target: ScanTarget, backend: ScanBackend, coverage: ScanCoverage, entry_count: string, logical_bytes: string, allocated_bytes: string, volume_used_bytes: string | null, unaccounted_bytes: string | null, started_at_ms: string, completed_at_ms: string, elapsed_ms: string, warnings: Array<ScanWarning>, };
