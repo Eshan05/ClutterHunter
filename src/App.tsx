@@ -1,8 +1,6 @@
-import { useEffect, useMemo, useState } from "react";
+import { lazy, Suspense, useEffect, useMemo, useState } from "react";
 import { Channel, invoke, isTauri } from "@tauri-apps/api/core";
 import {
-  Bot,
-  ChevronDown,
   ChevronRight,
   CircleGauge,
   Columns3,
@@ -14,13 +12,11 @@ import {
   Link2,
   ListTree,
   LoaderCircle,
-  MessageSquareText,
   PanelRightClose,
   PanelRightOpen,
   Play,
   Search,
   ShieldCheck,
-  Sparkles,
   Square,
 } from "lucide-react";
 import type { ItemPage } from "./bindings/ItemPage";
@@ -33,11 +29,11 @@ import type { ScanSummary } from "./bindings/ScanSummary";
 import type { ScanTarget } from "./bindings/ScanTarget";
 import "./App.css";
 
-type DockTab = "chat" | "plan";
 type Metric = "allocated" | "logical";
 type ScanStatus = "idle" | "scanning" | "cancelling" | "complete" | "error";
 
 const desktopRuntime = isTauri();
+const AgentDock = lazy(() => import("./AgentDock").then((module) => ({ default: module.AgentDock })));
 const browserTarget: ScanTarget = {
   id: "browser-preview",
   kind: "volume",
@@ -54,7 +50,6 @@ function App() {
   const [targets, setTargets] = useState<ScanTarget[]>([browserTarget]);
   const [selectedTargetId, setSelectedTargetId] = useState(browserTarget.id);
   const [metric, setMetric] = useState<Metric>("allocated");
-  const [dockTab, setDockTab] = useState<DockTab>("chat");
   const [dockOpen, setDockOpen] = useState(
     () => window.localStorage.getItem("clutterhunter:dock-open") !== "false",
   );
@@ -62,8 +57,10 @@ function App() {
   const [progress, setProgress] = useState<ScanProgress | null>(null);
   const [summary, setSummary] = useState<ScanSummary | null>(null);
   const [items, setItems] = useState<ItemRow[]>([]);
+  const [selectedItem, setSelectedItem] = useState<ItemRow | null>(null);
   const [scanError, setScanError] = useState<ScanFailure | null>(null);
   const [searchQuery, setSearchQuery] = useState("");
+  const [useTraversalFallback, setUseTraversalFallback] = useState(false);
 
   useEffect(() => {
     window.localStorage.setItem("clutterhunter:dock-open", String(dockOpen));
@@ -101,15 +98,20 @@ function App() {
   const allocatedValue = summary?.allocated_bytes ?? progress?.bytes_accounted ?? "0";
   const itemValue = summary?.entry_count ?? progress?.entries_seen ?? "0";
   const statusText = getStatusText(scanStatus, progress, summary, scanError);
+  const preferredBackend: ScanRequest["preferred_backend"] =
+    selectedTarget?.fast_scan_available && !useTraversalFallback ? "raw_ntfs" : "traversal";
+  const backendLabel = preferredBackend === "raw_ntfs" ? "MFT fast scan" : "traversal";
 
   const selectTarget = (targetId: string) => {
     setSelectedTargetId(targetId);
     setProgress(null);
     setSummary(null);
     setItems([]);
+    setSelectedItem(null);
     setSearchQuery("");
     setScanError(null);
     setScanStatus("idle");
+    setUseTraversalFallback(false);
   };
 
   const startOrCancelScan = async () => {
@@ -123,12 +125,13 @@ function App() {
 
     setScanStatus("scanning");
     setProgress(null);
+    setSelectedItem(null);
     setScanError(null);
     const onProgress = new Channel<ScanProgress>();
     onProgress.onmessage = (update) => setProgress(update);
     const request: ScanRequest = {
       target: selectedTarget,
-      preferred_backend: "traversal",
+      preferred_backend: preferredBackend,
     };
 
     try {
@@ -150,6 +153,13 @@ function App() {
     } catch (error) {
       const failure = normalizeFailure(error);
       setScanError(failure);
+      if (
+        preferredBackend === "raw_ntfs"
+        && failure.recoverable
+        && failure.code !== "SCAN_CANCELLED"
+      ) {
+        setUseTraversalFallback(true);
+      }
       setScanStatus(failure.code === "SCAN_CANCELLED" ? "idle" : "error");
     }
   };
@@ -175,7 +185,7 @@ function App() {
             ))}
           </select>
           <span className="target-meta">
-            {selectedTarget?.filesystem ?? "Unknown FS"} · traversal
+            {selectedTarget?.filesystem ?? "Unknown FS"} · {backendLabel}
           </span>
         </div>
 
@@ -184,14 +194,26 @@ function App() {
           type="button"
           disabled={!desktopRuntime || scanStatus === "cancelling"}
           title={desktopRuntime
-            ? "Run the read-only traversal backend"
+            ? preferredBackend === "raw_ntfs"
+              ? "Run the read-only MFT scanner (Windows will request access)"
+              : scanError
+                ? `Use traversal after ${scanError.code}`
+                : "Run the read-only traversal scanner"
             : "Open the Tauri desktop app to scan"}
           onClick={() => void startOrCancelScan()}
         >
           {scanStatus === "scanning" || scanStatus === "cancelling"
             ? <Square size={14} fill="currentColor" />
             : <Play size={16} fill="currentColor" />}
-          {scanStatus === "cancelling" ? "Cancelling" : scanStatus === "scanning" ? "Cancel" : summary ? "Rescan" : "Scan"}
+          {scanStatus === "cancelling"
+            ? "Cancelling"
+            : scanStatus === "scanning"
+              ? "Cancel"
+              : scanStatus === "error" && useTraversalFallback
+                ? "Use traversal"
+                : summary
+                  ? "Rescan"
+                  : "Scan"}
         </button>
         {(scanStatus === "scanning" || scanStatus === "cancelling") && (
           <span className="scan-progress-rail" aria-hidden="true"><span /></span>
@@ -260,7 +282,20 @@ function App() {
               </div>
               <div className="empty-table">
                 {visibleItems.length > 0 ? visibleItems.map((item) => (
-                  <div className="table-row data-row" key={item.id}>
+                  <div
+                    className={`table-row data-row ${selectedItem?.id === item.id ? "selected" : ""}`}
+                    key={item.id}
+                    role="button"
+                    tabIndex={0}
+                    aria-pressed={selectedItem?.id === item.id}
+                    onClick={() => setSelectedItem((current) => current?.id === item.id ? null : item)}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter" || event.key === " ") {
+                        event.preventDefault();
+                        setSelectedItem((current) => current?.id === item.id ? null : item);
+                      }
+                    }}
+                  >
                     <span className="name-cell item-name" title={item.display_path}>
                       {item.kind === "directory" ? <Folder size={15} /> : item.kind === "reparse_point" ? <Link2 size={15} /> : <File size={15} />}
                       <span>{item.name}</span>
@@ -309,26 +344,15 @@ function App() {
           </div>
         </div>
 
-        {dockOpen && (
-          <aside className="ai-dock" aria-label="On-device AI">
-            <div className="dock-tabs" role="tablist" aria-label="AI workspace">
-              <button type="button" role="tab" aria-selected={dockTab === "chat"} className={dockTab === "chat" ? "active" : ""} onClick={() => setDockTab("chat")}><MessageSquareText size={16} /> Chat</button>
-              <button type="button" role="tab" aria-selected={dockTab === "plan"} className={dockTab === "plan" ? "active" : ""} onClick={() => setDockTab("plan")}><ShieldCheck size={16} /> Plan <span className="count">0</span></button>
-            </div>
-            {dockTab === "chat" ? (
-              <div className="dock-content chat-content">
-                <div className="model-status"><span className="model-icon"><Bot size={19} /></span><span><strong>On-device AI</strong><small>Ollama not connected</small></span><ChevronDown size={15} /></div>
-                <div className="chat-empty"><Sparkles size={22} /><strong>Local assistant offline</strong><span>Analyzer remains available</span></div>
-                <div className="chat-composer"><textarea aria-label="Message ClutterHunter" placeholder="Ask about this scan" disabled /><button type="button" aria-label="Send message" disabled><ChevronRight size={17} /></button></div>
-              </div>
-            ) : (
-              <div className="dock-content plan-content">
-                <div className="plan-totals"><div><span>Conservative</span><strong>0 B</strong></div><div><span>Review potential</span><strong>0 B</strong></div></div>
-                <div className="plan-empty"><ShieldCheck size={24} /><strong>No cleanup plan</strong><span>0 selected items</span></div>
-              </div>
-            )}
-          </aside>
-        )}
+        <Suspense fallback={null}>
+          <AgentDock
+            desktopRuntime={desktopRuntime}
+            hidden={!dockOpen}
+            summary={summary}
+            attachment={selectedItem}
+            onClearAttachment={() => setSelectedItem(null)}
+          />
+        </Suspense>
       </section>
     </main>
   );
@@ -343,7 +367,7 @@ function normalizeFailure(error: unknown): ScanFailure {
 
 function getStatusText(status: ScanStatus, progress: ScanProgress | null, summary: ScanSummary | null, error: ScanFailure | null) {
   if (status === "scanning" || status === "cancelling") return status === "cancelling" ? "Stopping scan" : phaseLabel(progress?.phase);
-  if (status === "complete" && summary) return `Traversal · ${formatDuration(summary.elapsed_ms)}`;
+  if (status === "complete" && summary) return `${formatBackend(summary.backend)} · ${formatDuration(summary.elapsed_ms)}`;
   if (status === "error") return error?.code ?? "Scan failed";
   return desktopRuntime ? "Scanner ready" : "Desktop preview";
 }
@@ -401,7 +425,13 @@ function percentWidth(item: ItemRow, summary: ScanSummary | null, metric: Metric
 }
 
 function coverageLabel(summary: ScanSummary) {
-  return summary.coverage === "complete" ? "Complete traversal" : summary.coverage === "partial" ? "Partial coverage" : "Potentially stale";
+  if (summary.coverage === "partial") return "Partial coverage";
+  if (summary.coverage === "potentially_stale") return "Potentially stale";
+  return summary.backend === "raw_ntfs" ? "Complete MFT index" : "Complete traversal";
+}
+
+function formatBackend(backend: ScanSummary["backend"]) {
+  return backend === "raw_ntfs" ? "MFT" : "Traversal";
 }
 
 export default App;

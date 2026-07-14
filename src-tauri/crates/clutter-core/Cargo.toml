@@ -14,11 +14,15 @@ bincode = { version = "2.0.1", features = ["serde"] }
 clutter-protocol = { path = "../clutter-protocol" }
 getrandom = "0.4.3"
 windows = { version = "0.62.2", features = [
+  "ApplicationModel",
+  "Foundation_Collections",
+  "Management_Deployment",
   "Win32_Foundation",
   "Win32_Security",
   "Win32_Security_Authorization",
   "Win32_Storage_FileSystem",
   "Win32_System_IO",
+  "Win32_System_Ioctl",
   "Win32_System_Pipes",
   "Win32_System_ProcessStatus",
   "Win32_System_Registry",
