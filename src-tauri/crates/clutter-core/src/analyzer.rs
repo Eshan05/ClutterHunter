@@ -1,6 +1,11 @@
 use std::{
+    borrow::Cow,
     cmp::Ordering,
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering as AtomicOrdering},
+    },
 };
 
 use serde::{Deserialize, Serialize};
@@ -12,13 +17,15 @@ use crate::{
         AggregateDimension, CleanupPlan, CleanupPlanRequest, DismissSuggestionRequest, ItemDetails,
         ItemKind, ItemPage, ItemQuery, ItemRow, ItemSort, OwnerMatchKind, OwnerSummary,
         PathProtectionRequest, PlanActionKind, PlanEdit, PlanItem, PolicyEvidence, PolicyTier,
-        ScanCoverage, ScanFailure, SortDirection, StorageAggregate, StorageAggregateQuery,
-        StorageBucket, TreemapNode, TreemapQuery, TreemapSlice,
+        ScanCoverage, ScanFailure, ScanTarget, SortDirection, StorageAggregate,
+        StorageAggregateQuery, StorageBucket, TreemapNode, TreemapQuery, TreemapSlice,
     },
 };
 
 const RULE_VERSION: &str = "1";
 const NO_OWNER: u32 = u32::MAX;
+const MAX_CACHED_SORT_INDICES: usize = 8_000_000;
+const MAX_PLAN_ITEMS: usize = 500;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[repr(u8)]
@@ -29,14 +36,19 @@ enum Rule {
     InstalledApplication,
     PersonalData,
     SourceData,
+    EncryptedData,
+    BackupData,
     UserProtected,
     MixedContent,
     GeneratedProjectData,
     RecycleBin,
+    WindowsManagedCleanup,
     UserTemp,
     BrowserCache,
     CrashReports,
     ScoopCache,
+    NpmCache,
+    NpmLogs,
     OllamaModels,
     OllamaBlobs,
 }
@@ -50,14 +62,19 @@ impl Rule {
             Self::InstalledApplication => "protected.installed_application",
             Self::PersonalData => "protected.personal_data",
             Self::SourceData => "protected.source_data",
+            Self::EncryptedData => "protected.encrypted_data",
+            Self::BackupData => "protected.backup_data",
             Self::UserProtected => "protected.user_path",
             Self::MixedContent => "protected.mixed_cleanup_content",
             Self::GeneratedProjectData => "review.generated_project_data",
             Self::RecycleBin => "review.recycle_bin",
+            Self::WindowsManagedCleanup => "review.windows_managed_cleanup",
             Self::UserTemp => "cleanup.user_temp",
             Self::BrowserCache => "cleanup.browser_cache",
             Self::CrashReports => "cleanup.crash_reports",
             Self::ScoopCache => "cleanup.scoop_cache",
+            Self::NpmCache => "cleanup.npm_cache",
+            Self::NpmLogs => "cleanup.npm_logs",
             Self::OllamaModels => "review.ollama_models",
             Self::OllamaBlobs => "protected.ollama_shared_blobs",
         }
@@ -65,12 +82,16 @@ impl Rule {
 
     fn tier(self) -> PolicyTier {
         match self {
-            Self::GeneratedProjectData | Self::RecycleBin | Self::OllamaModels => {
-                PolicyTier::ReviewRequired
-            }
-            Self::UserTemp | Self::BrowserCache | Self::CrashReports | Self::ScoopCache => {
-                PolicyTier::CleanupCandidate
-            }
+            Self::GeneratedProjectData
+            | Self::RecycleBin
+            | Self::WindowsManagedCleanup
+            | Self::OllamaModels => PolicyTier::ReviewRequired,
+            Self::UserTemp
+            | Self::BrowserCache
+            | Self::CrashReports
+            | Self::ScoopCache
+            | Self::NpmCache
+            | Self::NpmLogs => PolicyTier::CleanupCandidate,
             _ => PolicyTier::Protected,
         }
     }
@@ -80,16 +101,24 @@ impl Rule {
             Self::ScoopCache => PlanActionKind::RunScoopCache,
             Self::OllamaModels => PlanActionKind::RunOllamaRm,
             Self::InstalledApplication => PlanActionKind::OpenWindowsAppsSettings,
-            Self::System | Self::RecycleBin => PlanActionKind::OpenWindowsStorageSettings,
+            Self::System | Self::RecycleBin | Self::WindowsManagedCleanup => {
+                PlanActionKind::OpenWindowsStorageSettings
+            }
             Self::Unknown
             | Self::ScanRoot
             | Self::PersonalData
             | Self::SourceData
+            | Self::EncryptedData
+            | Self::BackupData
             | Self::UserProtected
             | Self::MixedContent
             | Self::GeneratedProjectData
             | Self::OllamaBlobs => PlanActionKind::OpenLocation,
-            Self::UserTemp | Self::BrowserCache | Self::CrashReports => PlanActionKind::Inspect,
+            Self::UserTemp
+            | Self::BrowserCache
+            | Self::CrashReports
+            | Self::NpmCache
+            | Self::NpmLogs => PlanActionKind::Inspect,
         }
     }
 
@@ -99,6 +128,8 @@ impl Rule {
             Self::BrowserCache => 1,
             Self::CrashReports => 2,
             Self::ScoopCache => 3,
+            Self::NpmCache => 4,
+            Self::NpmLogs => 5,
             _ => u8::MAX,
         }
     }
@@ -107,12 +138,45 @@ impl Rule {
         match self {
             Self::GeneratedProjectData => "Generated project data",
             Self::RecycleBin => "Recycle Bin contents",
+            Self::WindowsManagedCleanup => "Windows-managed cleanup",
             Self::UserTemp => "User temporary files",
             Self::BrowserCache => "Browser caches",
             Self::CrashReports => "Crash reports",
             Self::ScoopCache => "Scoop download cache",
+            Self::NpmCache => "npm package cache",
+            Self::NpmLogs => "npm diagnostic logs",
             Self::OllamaModels => "Ollama models",
             _ => "Storage item",
+        }
+    }
+
+    fn evidence(self) -> &'static str {
+        match self {
+            Self::Unknown => "No reviewed cleanup rule matched this item",
+            Self::ScanRoot => "Scan roots cannot be cleanup-plan items",
+            Self::System => "Path is inside a protected Windows or shared system root",
+            Self::InstalledApplication => "Path is owned by an installed application",
+            Self::PersonalData => "File extension is associated with personal content",
+            Self::SourceData => "Name or extension identifies source or VCS data",
+            Self::EncryptedData => "Filesystem metadata marks this item as encrypted",
+            Self::BackupData => "Name or extension identifies backup data",
+            Self::UserProtected => "Path matches a persistent user protection",
+            Self::MixedContent => "Directory contains content outside one cleanup rule",
+            Self::GeneratedProjectData => {
+                "Directory is generated project data and may require a rebuild"
+            }
+            Self::RecycleBin => "Path is inside the Recycle Bin and requires user review",
+            Self::WindowsManagedCleanup => "Path is managed by Windows cleanup surfaces",
+            Self::UserTemp => "Path is inside the current user's exact temporary-data root",
+            Self::BrowserCache => "Path matches a reviewed browser cache component",
+            Self::CrashReports => "Path matches the Windows user crash-dump root",
+            Self::ScoopCache => "Path is inside Scoop's exact download-cache root",
+            Self::NpmCache => "Path matches npm's content-addressed package cache",
+            Self::NpmLogs => "Path matches npm's diagnostic-log directory",
+            Self::OllamaModels => "Path is Ollama model storage; removal must use ollama rm",
+            Self::OllamaBlobs => {
+                "Path is shared Ollama blob storage and cannot be deleted directly"
+            }
         }
     }
 }
@@ -125,12 +189,40 @@ pub struct AnalyzerIndex {
     node_owners: Vec<u32>,
     user_protected: Vec<bool>,
     dismissed: HashSet<(String, String)>,
+    sort_cache: Mutex<SortCache>,
+    volume_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SortCacheKey {
+    parent: u32,
+    sort: ItemSort,
+    direction: SortDirection,
+}
+
+#[derive(Debug, Default)]
+struct SortCache {
+    entries: VecDeque<(SortCacheKey, Arc<[u32]>)>,
+    total_indices: usize,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AnalyzerSettings {
-    pub protected_paths: Vec<String>,
+    pub protected_paths: Vec<ProtectedPath>,
     pub dismissed_suggestions: Vec<DismissedSuggestion>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ProtectedPath {
+    Identified {
+        volume_id: String,
+        relative_path: String,
+    },
+    Absolute {
+        absolute_path: String,
+    },
+    Legacy(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -139,8 +231,62 @@ pub struct DismissedSuggestion {
     pub rule_id: String,
 }
 
+impl AnalyzerSettings {
+    pub fn normalized(mut self) -> Self {
+        self.protected_paths = self
+            .protected_paths
+            .into_iter()
+            .filter_map(ProtectedPath::normalized)
+            .collect();
+        self.protected_paths.sort();
+        self.protected_paths.dedup();
+        self.dismissed_suggestions = self
+            .dismissed_suggestions
+            .into_iter()
+            .filter_map(|suggestion| {
+                let canonical_path = canonical_path(&suggestion.canonical_path);
+                let rule_id = suggestion.rule_id.trim().to_owned();
+                (!canonical_path.is_empty() && !rule_id.is_empty() && rule_id.len() <= 256)
+                    .then_some(DismissedSuggestion {
+                        canonical_path,
+                        rule_id,
+                    })
+            })
+            .collect();
+        self.dismissed_suggestions.sort_by(|left, right| {
+            left.canonical_path
+                .cmp(&right.canonical_path)
+                .then_with(|| left.rule_id.cmp(&right.rule_id))
+        });
+        self.dismissed_suggestions.dedup();
+        self
+    }
+}
+
+impl ProtectedPath {
+    fn normalized(self) -> Option<Self> {
+        match self {
+            Self::Identified {
+                volume_id,
+                relative_path,
+            } => {
+                let volume_id = canonical_volume_id(&volume_id);
+                let relative_path = canonical_relative_path(&relative_path);
+                (!volume_id.is_empty() && !relative_path.is_empty()).then_some(Self::Identified {
+                    volume_id,
+                    relative_path,
+                })
+            }
+            Self::Absolute { absolute_path } | Self::Legacy(absolute_path) => {
+                let absolute_path = canonical_path(absolute_path);
+                (!absolute_path.is_empty()).then_some(Self::Absolute { absolute_path })
+            }
+        }
+    }
+}
+
 impl AnalyzerIndex {
-    pub fn build(arena: &ScanArena, coverage: ScanCoverage) -> Self {
+    pub fn build(arena: &ScanArena, coverage: ScanCoverage, target: &ScanTarget) -> Self {
         let owners = discover_owners();
         let owner_roots: HashMap<_, _> = owners
             .iter()
@@ -153,6 +299,8 @@ impl AnalyzerIndex {
             node_owners: vec![NO_OWNER; arena.node_count()],
             user_protected: vec![false; arena.node_count()],
             dismissed: HashSet::new(),
+            sort_cache: Mutex::new(SortCache::default()),
+            volume_id: target.volume_id.as_deref().map(canonical_volume_id),
             owners,
         };
         if arena.node_count() == 0 {
@@ -212,13 +360,16 @@ impl AnalyzerIndex {
     }
 
     pub fn apply_settings(&mut self, arena: &ScanArena, settings: &AnalyzerSettings) {
+        if let Ok(mut cache) = self.sort_cache.lock() {
+            *cache = SortCache::default();
+        }
         self.user_protected.fill(false);
         if !settings.protected_paths.is_empty() && arena.node_count() > 0 {
             let mut path = canonical_path(arena.path(0));
             let root_protected = settings
                 .protected_paths
                 .iter()
-                .any(|protected| is_same_or_descendant(&path, protected));
+                .any(|protected| self.protection_matches(&path, protected));
             self.user_protected[0] = root_protected;
             let mut stack = vec![SettingsFrame {
                 next_child: arena.node(0).map_or(NO_INDEX, |node| node.first_child),
@@ -248,7 +399,7 @@ impl AnalyzerIndex {
                     || settings
                         .protected_paths
                         .iter()
-                        .any(|root| is_same_or_descendant(&path, root));
+                        .any(|root| self.protection_matches(&path, root));
                 self.user_protected[child as usize] = protected;
                 stack.push(SettingsFrame {
                     next_child: node.first_child,
@@ -284,13 +435,50 @@ impl AnalyzerIndex {
                     .capacity()
                     .saturating_mul(std::mem::size_of::<bool>()),
             );
-        u64::try_from(fixed).unwrap_or(u64::MAX)
+        let cached = self.sort_cache.lock().map_or(0, |cache| {
+            cache
+                .total_indices
+                .saturating_mul(std::mem::size_of::<u32>())
+        });
+        u64::try_from(fixed.saturating_add(cached)).unwrap_or(u64::MAX)
     }
 
-    pub fn protection_key(&self, arena: &ScanArena, node_id: &str) -> Result<String, ScanFailure> {
-        arena
-            .parse_node_id(node_id)
-            .map(|index| canonical_path(arena.path(index)))
+    pub fn protection_key(
+        &self,
+        arena: &ScanArena,
+        node_id: &str,
+    ) -> Result<ProtectedPath, ScanFailure> {
+        let index = arena.parse_node_id(node_id)?;
+        let path = canonical_path(arena.path(index));
+        if let Some(volume_id) = &self.volume_id
+            && let Some(relative_path) = volume_relative_path(&path)
+        {
+            return Ok(ProtectedPath::Identified {
+                volume_id: volume_id.clone(),
+                relative_path,
+            });
+        }
+        Ok(ProtectedPath::Absolute {
+            absolute_path: path,
+        })
+    }
+
+    fn protection_matches(&self, path: &str, protected: &ProtectedPath) -> bool {
+        match protected {
+            ProtectedPath::Identified {
+                volume_id,
+                relative_path,
+            } => {
+                self.volume_id
+                    .as_ref()
+                    .is_some_and(|current| current == &canonical_volume_id(volume_id))
+                    && volume_relative_path(path)
+                        .is_some_and(|current| is_same_or_descendant(&current, relative_path))
+            }
+            ProtectedPath::Absolute { absolute_path } | ProtectedPath::Legacy(absolute_path) => {
+                is_same_or_descendant(path, &canonical_path(absolute_path))
+            }
+        }
     }
 
     pub fn dismissal_key(
@@ -314,6 +502,15 @@ impl AnalyzerIndex {
     }
 
     pub fn query(&self, arena: &ScanArena, query: &ItemQuery) -> Result<ItemPage, ScanFailure> {
+        self.query_cancellable(arena, query, &AtomicBool::new(false))
+    }
+
+    pub fn query_cancellable(
+        &self,
+        arena: &ScanArena,
+        query: &ItemQuery,
+        cancel: &AtomicBool,
+    ) -> Result<ItemPage, ScanFailure> {
         let scope = query
             .scope_id
             .as_deref()
@@ -323,6 +520,7 @@ impl AnalyzerIndex {
             .unwrap_or(0);
         validate_decimal_filter(query.min_bytes.as_deref(), "min_bytes")?;
         validate_decimal_filter(query.modified_before_ms.as_deref(), "modified_before_ms")?;
+        validate_query_id(query.query_id.as_deref())?;
         let recursive = query
             .text
             .as_ref()
@@ -333,25 +531,33 @@ impl AnalyzerIndex {
             || query.owner_ids.is_some()
             || query.min_bytes.is_some()
             || query.modified_before_ms.is_some();
-        let mut candidates = if recursive {
-            descendants(arena, scope)
+        let signature = query_fingerprint(query, scope);
+        let candidates = if recursive {
+            let mut candidates = Vec::new();
+            visit_descendants(arena, scope, cancel, |index| {
+                if self.matches(arena, index, query) {
+                    candidates.push(index);
+                }
+            })?;
+            ensure_query_active(cancel)?;
+            candidates.sort_unstable_by(|left, right| {
+                let ordering = self.compare(arena, *left, *right, query.sort);
+                let ordering = match query.direction {
+                    SortDirection::Asc => ordering,
+                    SortDirection::Desc => ordering.reverse(),
+                };
+                ordering.then_with(|| left.cmp(right))
+            });
+            Arc::<[u32]>::from(candidates)
         } else {
-            arena.child_indices(scope)?
+            self.sorted_children(arena, scope, query.sort, query.direction)?
         };
-        candidates.retain(|index| self.matches(arena, *index, query));
-        candidates.sort_unstable_by(|left, right| {
-            let ordering = self.compare(arena, *left, *right, query.sort);
-            let ordering = match query.direction {
-                SortDirection::Asc => ordering,
-                SortDirection::Desc => ordering.reverse(),
-            };
-            ordering.then_with(|| left.cmp(right))
-        });
+        ensure_query_active(cancel)?;
 
         let start = query
             .cursor
             .as_deref()
-            .map(|cursor| parse_query_cursor(arena, cursor))
+            .map(|cursor| parse_query_cursor(arena, cursor, signature))
             .transpose()?
             .unwrap_or(0);
         if start > candidates.len() {
@@ -367,9 +573,57 @@ impl AnalyzerIndex {
             .iter()
             .map(|index| self.item_row(arena, *index))
             .collect();
-        let next_cursor =
-            (end < candidates.len()).then(|| format!("{}:query:{end}", arena.session_id()));
+        let next_cursor = (end < candidates.len()).then(|| query_cursor(arena, signature, end));
         Ok(ItemPage { items, next_cursor })
+    }
+
+    fn sorted_children(
+        &self,
+        arena: &ScanArena,
+        parent: u32,
+        sort: ItemSort,
+        direction: SortDirection,
+    ) -> Result<Arc<[u32]>, ScanFailure> {
+        let key = SortCacheKey {
+            parent,
+            sort,
+            direction,
+        };
+        if let Ok(mut cache) = self.sort_cache.lock()
+            && let Some(position) = cache
+                .entries
+                .iter()
+                .position(|(candidate, _)| *candidate == key)
+        {
+            let entry = cache.entries.remove(position).expect("cache entry exists");
+            let result = Arc::clone(&entry.1);
+            cache.entries.push_back(entry);
+            return Ok(result);
+        }
+
+        let mut children = arena.child_indices(parent)?;
+        children.sort_unstable_by(|left, right| {
+            let ordering = self.compare(arena, *left, *right, sort);
+            let ordering = match direction {
+                SortDirection::Asc => ordering,
+                SortDirection::Desc => ordering.reverse(),
+            };
+            ordering.then_with(|| left.cmp(right))
+        });
+        let result = Arc::<[u32]>::from(children);
+        if result.len() <= MAX_CACHED_SORT_INDICES
+            && let Ok(mut cache) = self.sort_cache.lock()
+        {
+            while cache.total_indices.saturating_add(result.len()) > MAX_CACHED_SORT_INDICES {
+                let Some((_, evicted)) = cache.entries.pop_front() else {
+                    break;
+                };
+                cache.total_indices = cache.total_indices.saturating_sub(evicted.len());
+            }
+            cache.total_indices = cache.total_indices.saturating_add(result.len());
+            cache.entries.push_back((key, Arc::clone(&result)));
+        }
+        Ok(result)
     }
 
     pub fn item_details(
@@ -396,27 +650,30 @@ impl AnalyzerIndex {
             .map(|id| arena.parse_node_id(id))
             .transpose()?
             .unwrap_or(0);
-        let indices = if query.dimension == AggregateDimension::Kind {
-            arena.child_indices(scope)?
-        } else {
-            descendants(arena, scope)
-                .into_iter()
-                .filter(|index| arena.node(*index).is_some_and(|node| !node.is_directory()))
-                .collect()
-        };
-        let mut buckets = BTreeMap::<String, BucketAccumulator>::new();
-        for index in indices {
+        let mut buckets = BTreeMap::<Cow<'_, str>, BucketAccumulator>::new();
+        let mut add = |index| {
             let Some(node) = arena.node(index) else {
-                continue;
+                return;
             };
             let (key, label) = self.aggregate_key(arena, index, query.dimension);
             let bucket = buckets.entry(key).or_insert_with(|| BucketAccumulator {
-                label,
+                label: label.into_owned(),
                 ..BucketAccumulator::default()
             });
             bucket.items = bucket.items.saturating_add(1);
             bucket.logical = bucket.logical.saturating_add(node.logical_bytes);
             bucket.allocated = bucket.allocated.saturating_add(node.allocated_bytes);
+        };
+        if query.dimension == AggregateDimension::Kind {
+            for index in arena.child_indices(scope)? {
+                add(index);
+            }
+        } else {
+            visit_descendants(arena, scope, &AtomicBool::new(false), |index| {
+                if arena.node(index).is_some_and(|node| !node.is_directory()) {
+                    add(index);
+                }
+            })?;
         }
         let mut buckets: Vec<_> = buckets.into_iter().collect();
         buckets.sort_unstable_by(|left, right| {
@@ -441,7 +698,7 @@ impl AnalyzerIndex {
             buckets: buckets
                 .into_iter()
                 .map(|(key, bucket)| StorageBucket {
-                    key,
+                    key: key.into_owned(),
                     label: bucket.label,
                     item_count: bucket.items.to_string(),
                     logical_bytes: bucket.logical.to_string(),
@@ -465,22 +722,17 @@ impl AnalyzerIndex {
             .map(|id| arena.parse_node_id(id))
             .transpose()?
             .unwrap_or(0);
-        let mut children = arena.child_indices(scope)?;
-        children.sort_unstable_by(|left, right| {
-            arena
-                .node(*right)
-                .map_or(0, |node| node.allocated_bytes)
-                .cmp(&arena.node(*left).map_or(0, |node| node.allocated_bytes))
-                .then_with(|| arena.name(*left).cmp(arena.name(*right)))
-        });
+        let children =
+            self.sorted_children(arena, scope, ItemSort::Allocated, SortDirection::Desc)?;
         let limit = usize::from(query.max_nodes.clamp(1, 5_000));
-        let hidden = children.split_off(limit.min(children.len()));
+        let visible = limit.min(children.len());
+        let hidden = &children[visible..];
         let other_allocated = hidden.iter().fold(0u64, |total, index| {
             total.saturating_add(arena.node(*index).map_or(0, |node| node.allocated_bytes))
         });
-        let mut nodes: Vec<_> = children
-            .into_iter()
-            .map(|index| self.treemap_node(arena, index, Some(scope)))
+        let mut nodes: Vec<_> = children[..visible]
+            .iter()
+            .map(|index| self.treemap_node(arena, *index, Some(scope)))
             .collect();
         if other_allocated > 0 {
             nodes.push(TreemapNode {
@@ -496,7 +748,7 @@ impl AnalyzerIndex {
         }
         Ok(TreemapSlice {
             nodes,
-            truncated: !hidden.is_empty(),
+            truncated: visible < children.len(),
             other_allocated_bytes: other_allocated.to_string(),
         })
     }
@@ -512,7 +764,7 @@ impl AnalyzerIndex {
             .map(|value| parse_decimal(value, "target_bytes"))
             .transpose()?;
         let uniform_candidates = self.uniform_candidate_rules(arena);
-        let mut groups = BTreeMap::<(Rule, u32), Opportunity>::new();
+        let mut opportunities = Vec::<PlanOpportunity>::new();
         for index in 1..arena.node_count() as u32 {
             let rule = self.effective_rule(index);
             let tier = self.effective_tier(index);
@@ -542,24 +794,41 @@ impl AnalyzerIndex {
                 continue;
             }
             let owner = self.node_owners[index as usize];
-            let group = groups.entry((rule, owner)).or_default();
-            group.nodes.push(index);
-            group.bytes = group.bytes.saturating_add(node.allocated_bytes);
+            opportunities.push(PlanOpportunity {
+                index,
+                rule,
+                owner,
+                bytes: node.allocated_bytes,
+            });
         }
-        let mut opportunities: Vec<_> = groups.into_iter().collect();
         opportunities.sort_unstable_by(|left, right| {
-            plan_tier_rank(left.0.0.tier())
-                .cmp(&plan_tier_rank(right.0.0.tier()))
-                .then_with(|| left.0.0.priority().cmp(&right.0.0.priority()))
-                .then_with(|| right.1.bytes.cmp(&left.1.bytes))
-                .then_with(|| left.0.cmp(&right.0))
+            plan_tier_rank(left.rule.tier())
+                .cmp(&plan_tier_rank(right.rule.tier()))
+                .then_with(|| left.rule.priority().cmp(&right.rule.priority()))
+                .then_with(|| right.bytes.cmp(&left.bytes))
+                .then_with(|| left.rule.cmp(&right.rule))
+                .then_with(|| left.owner.cmp(&right.owner))
+                .then_with(|| left.index.cmp(&right.index))
         });
 
         let mut selected_candidate = 0u64;
         let mut review_potential = 0u64;
         let mut items = Vec::with_capacity(opportunities.len());
-        for ((rule, _owner), opportunity) in opportunities {
+        let mut omitted_items = 0u64;
+        let mut omitted_candidates = 0u64;
+        let mut omitted_review = 0u64;
+        for opportunity in opportunities {
+            let rule = opportunity.rule;
             let tier = rule.tier();
+            if items.len() >= MAX_PLAN_ITEMS {
+                omitted_items = omitted_items.saturating_add(1);
+                if tier == PolicyTier::CleanupCandidate {
+                    omitted_candidates = omitted_candidates.saturating_add(opportunity.bytes);
+                } else if tier == PolicyTier::ReviewRequired {
+                    omitted_review = omitted_review.saturating_add(opportunity.bytes);
+                }
+                continue;
+            }
             let selected = tier == PolicyTier::CleanupCandidate
                 && target.is_none_or(|target| selected_candidate < target);
             if selected {
@@ -568,20 +837,11 @@ impl AnalyzerIndex {
             if tier == PolicyTier::ReviewRequired {
                 review_potential = review_potential.saturating_add(opportunity.bytes);
             }
-            let evidence = opportunity
-                .nodes
-                .iter()
-                .take(3)
-                .map(|index| self.policy_evidence(arena, *index))
-                .collect();
+            let evidence = vec![self.policy_evidence(arena, opportunity.index)];
             items.push(PlanItem {
                 id: format!("{}:plan:{}", arena.session_id(), items.len()),
-                node_ids: opportunity
-                    .nodes
-                    .iter()
-                    .map(|index| arena.node_id(*index))
-                    .collect(),
-                title: rule.title().to_owned(),
+                node_ids: vec![arena.node_id(opportunity.index)],
+                title: format!("{}: {}", rule.title(), arena.name(opportunity.index)),
                 category: rule.id().to_owned(),
                 tier,
                 selected,
@@ -600,6 +860,10 @@ impl AnalyzerIndex {
             target_shortfall_bytes: target
                 .map_or(0, |target| target.saturating_sub(selected_candidate))
                 .to_string(),
+            truncated: omitted_items > 0,
+            omitted_item_count: omitted_items.to_string(),
+            omitted_candidate_bytes: omitted_candidates.to_string(),
+            omitted_review_bytes: omitted_review.to_string(),
             items,
         })
     }
@@ -691,9 +955,30 @@ impl AnalyzerIndex {
     fn policy_evidence(&self, arena: &ScanArena, index: u32) -> PolicyEvidence {
         let rule = self.effective_rule(index);
         let tier = self.effective_tier(index);
-        let mut facts = vec![format!("Matched bundled policy rule {}", rule.id())];
+        let mut facts = vec![
+            format!("Matched bundled policy rule {}", rule.id()),
+            rule.evidence().to_owned(),
+        ];
         if let Some(node) = arena.node(index) {
             facts.push(format!("Allocated bytes: {}", node.allocated_bytes));
+            if node.is_sparse() {
+                facts.push("Filesystem metadata marks this item as sparse".to_owned());
+            }
+            if node.is_compressed() {
+                facts.push("Filesystem metadata marks this item as compressed".to_owned());
+            }
+            if node.has_named_stream() {
+                facts.push("Allocated and logical totals include named data streams".to_owned());
+            }
+            if node.is_encrypted() {
+                facts.push("Filesystem metadata marks this item as encrypted".to_owned());
+            }
+            if node.is_reparse_point() {
+                facts.push("Reparse target was not traversed".to_owned());
+            }
+            if node.is_inaccessible() {
+                facts.push("Scanner could not enumerate this item's contents".to_owned());
+            }
         }
         let mut inference = Vec::new();
         if let Some(owner) = self.owner_summary(arena, index) {
@@ -760,11 +1045,9 @@ impl AnalyzerIndex {
             return false;
         }
         if let Some(extensions) = &query.extensions {
-            let extension = extension(arena.name(index));
+            let extension = extension_slice(arena.name(index));
             if !extensions.iter().any(|candidate| {
-                extension
-                    .as_deref()
-                    .is_some_and(|value| value.eq_ignore_ascii_case(candidate))
+                extension.is_some_and(|value| value.eq_ignore_ascii_case(candidate))
             }) {
                 return false;
             }
@@ -830,28 +1113,59 @@ impl AnalyzerIndex {
         }
     }
 
-    fn aggregate_key(
-        &self,
-        arena: &ScanArena,
+    fn aggregate_key<'a>(
+        &'a self,
+        arena: &'a ScanArena,
         index: u32,
         dimension: AggregateDimension,
-    ) -> (String, String) {
+    ) -> (Cow<'a, str>, Cow<'a, str>) {
         match dimension {
-            AggregateDimension::Extension => extension(arena.name(index))
-                .map(|extension| (extension.clone(), extension))
-                .unwrap_or_else(|| ("(none)".to_owned(), "No extension".to_owned())),
+            AggregateDimension::Extension => extension_slice(arena.name(index))
+                .map(|extension| {
+                    let extension = if extension.bytes().any(|byte| byte.is_ascii_uppercase()) {
+                        Cow::Owned(extension.to_ascii_lowercase())
+                    } else {
+                        Cow::Borrowed(extension)
+                    };
+                    (extension.clone(), extension)
+                })
+                .unwrap_or_else(|| (Cow::Borrowed("(none)"), Cow::Borrowed("No extension"))),
             AggregateDimension::Owner => self
                 .owners
                 .get(self.node_owners[index as usize] as usize)
-                .map(|owner| (owner.summary.id.clone(), owner.summary.name.clone()))
-                .unwrap_or_else(|| ("unknown".to_owned(), "Unknown owner".to_owned())),
+                .map(|owner| {
+                    (
+                        Cow::Borrowed(owner.summary.id.as_str()),
+                        Cow::Borrowed(owner.summary.name.as_str()),
+                    )
+                })
+                .unwrap_or_else(|| (Cow::Borrowed("unknown"), Cow::Borrowed("Unknown owner"))),
             AggregateDimension::Policy => {
                 let tier = self.effective_tier(index);
-                (format!("{tier:?}").to_lowercase(), format!("{tier:?}"))
+                match tier {
+                    PolicyTier::Protected => {
+                        (Cow::Borrowed("protected"), Cow::Borrowed("Protected"))
+                    }
+                    PolicyTier::ReviewRequired => (
+                        Cow::Borrowed("review_required"),
+                        Cow::Borrowed("Review required"),
+                    ),
+                    PolicyTier::CleanupCandidate => (
+                        Cow::Borrowed("cleanup_candidate"),
+                        Cow::Borrowed("Cleanup candidate"),
+                    ),
+                }
             }
             AggregateDimension::Kind => {
                 let kind = arena.node(index).map_or(ItemKind::File, item_kind);
-                (format!("{kind:?}").to_lowercase(), format!("{kind:?}"))
+                match kind {
+                    ItemKind::File => (Cow::Borrowed("file"), Cow::Borrowed("File")),
+                    ItemKind::Directory => (Cow::Borrowed("directory"), Cow::Borrowed("Directory")),
+                    ItemKind::ReparsePoint => (
+                        Cow::Borrowed("reparse_point"),
+                        Cow::Borrowed("Reparse point"),
+                    ),
+                }
             }
         }
     }
@@ -936,12 +1250,18 @@ fn classify(
     owners: &[OwnerRecord],
 ) -> Rule {
     let name = name.to_lowercase();
-    let extension = extension(&name);
-    if is_personal_extension(extension.as_deref()) {
+    let extension = extension_slice(&name);
+    if is_personal_extension(extension) {
         return Rule::PersonalData;
     }
-    if is_source_name(&name) || is_source_extension(extension.as_deref()) {
+    if is_source_name(&name) || is_source_extension(extension) {
         return Rule::SourceData;
+    }
+    if node.is_encrypted() {
+        return Rule::EncryptedData;
+    }
+    if is_backup_name(&name, extension) {
+        return Rule::BackupData;
     }
     if node.is_reparse_point() || node.is_inaccessible() {
         return Rule::Unknown;
@@ -966,6 +1286,12 @@ fn classify(
     if contains_subtree(path, "\\$recycle.bin") {
         return Rule::RecycleBin;
     }
+    if is_windows_managed_cleanup(path) {
+        return Rule::WindowsManagedCleanup;
+    }
+    if parent_rule == Rule::System || is_system_path(path) {
+        return Rule::System;
+    }
     if contains_subtree(path, "\\appdata\\local\\crashdumps") {
         return Rule::CrashReports;
     }
@@ -975,6 +1301,12 @@ fn classify(
     if is_browser_cache(path) {
         return Rule::BrowserCache;
     }
+    if is_npm_cache(path) {
+        return Rule::NpmCache;
+    }
+    if is_npm_logs(path) {
+        return Rule::NpmLogs;
+    }
     if let Some(owner) = owners
         .get(owner as usize)
         .filter(|owner| owner.summary.id == "scoop")
@@ -983,9 +1315,6 @@ fn classify(
         if relative == "\\cache" || relative.starts_with("\\cache\\") {
             return Rule::ScoopCache;
         }
-    }
-    if parent_rule == Rule::System || is_system_path(path) {
-        return Rule::System;
     }
     if parent_rule == Rule::InstalledApplication || owner != NO_OWNER {
         return Rule::InstalledApplication;
@@ -1071,6 +1400,21 @@ fn is_source_extension(extension: Option<&str>) -> bool {
     })
 }
 
+fn is_backup_name(name: &str, extension: Option<&str>) -> bool {
+    matches!(name, "backup" | "backups" | "windows.old")
+        || extension.is_some_and(|extension| {
+            matches!(
+                extension,
+                "bak" | "backup" | "bkf" | "vhd" | "vhdx" | "vmdk" | "qcow2"
+            )
+        })
+}
+
+fn is_windows_managed_cleanup(path: &str) -> bool {
+    contains_subtree(path, "\\microsoft\\windows\\wer\\reportarchive")
+        || contains_subtree(path, "\\microsoft\\windows\\wer\\reportqueue")
+}
+
 fn is_browser_cache(path: &str) -> bool {
     (contains_subtree(path, "\\google\\chrome\\user data")
         || contains_subtree(path, "\\microsoft\\edge\\user data")
@@ -1078,6 +1422,18 @@ fn is_browser_cache(path: &str) -> bool {
         && ["cache", "cache_data", "code cache", "gpucache"]
             .iter()
             .any(|component| has_component(path, component))
+}
+
+fn is_npm_cache(path: &str) -> bool {
+    (contains_subtree(path, "\\appdata\\local\\npm-cache")
+        || contains_subtree(path, "\\appdata\\roaming\\npm-cache"))
+        && has_component(path, "_cacache")
+}
+
+fn is_npm_logs(path: &str) -> bool {
+    (contains_subtree(path, "\\appdata\\local\\npm-cache")
+        || contains_subtree(path, "\\appdata\\roaming\\npm-cache"))
+        && has_component(path, "_logs")
 }
 
 fn contains_subtree(path: &str, marker: &str) -> bool {
@@ -1094,6 +1450,29 @@ fn is_same_or_descendant(path: &str, root: &str) -> bool {
             .is_some_and(|suffix| suffix.starts_with('\\'))
 }
 
+fn canonical_volume_id(volume_id: &str) -> String {
+    volume_id.trim().replace('/', "\\").to_lowercase()
+}
+
+fn canonical_relative_path(path: &str) -> String {
+    let mut path = path.trim().replace('/', "\\").to_lowercase();
+    if !path.starts_with('\\') {
+        path.insert(0, '\\');
+    }
+    while path.len() > 1 && path.ends_with('\\') {
+        path.pop();
+    }
+    path
+}
+
+fn volume_relative_path(path: &str) -> Option<String> {
+    let bytes = path.as_bytes();
+    if bytes.len() < 2 || bytes[1] != b':' || !bytes[0].is_ascii_alphabetic() {
+        return None;
+    }
+    Some(canonical_relative_path(path.get(2..).unwrap_or("\\")))
+}
+
 fn has_component(path: &str, component: &str) -> bool {
     path.split('\\').any(|part| part == component)
 }
@@ -1106,10 +1485,10 @@ fn plan_tier_rank(tier: PolicyTier) -> u8 {
     }
 }
 
-fn extension(name: &str) -> Option<String> {
+fn extension_slice(name: &str) -> Option<&str> {
     name.rsplit_once('.')
         .filter(|(stem, extension)| !stem.is_empty() && !extension.is_empty())
-        .map(|(_, extension)| extension.to_lowercase())
+        .map(|(_, extension)| extension)
 }
 
 fn contains_case_insensitive(value: &str, needle: &str) -> bool {
@@ -1156,12 +1535,185 @@ fn descendants(arena: &ScanArena, root: u32) -> Vec<u32> {
     result
 }
 
-fn parse_query_cursor(arena: &ScanArena, cursor: &str) -> Result<usize, ScanFailure> {
-    let prefix = format!("{}:query:", arena.session_id());
-    cursor
-        .strip_prefix(&prefix)
-        .and_then(|value| value.parse().ok())
-        .ok_or_else(stale_session)
+fn visit_descendants(
+    arena: &ScanArena,
+    root: u32,
+    cancel: &AtomicBool,
+    mut visit: impl FnMut(u32),
+) -> Result<(), ScanFailure> {
+    let mut stack = Vec::new();
+    if let Some(root) = arena.node(root) {
+        let mut child = root.first_child;
+        while child != NO_INDEX {
+            stack.push(child);
+            child = arena.node(child).map_or(NO_INDEX, |node| node.next_sibling);
+        }
+    }
+    let mut visited = 0usize;
+    while let Some(index) = stack.pop() {
+        if visited & 0x3ff == 0 {
+            ensure_query_active(cancel)?;
+        }
+        visit(index);
+        visited = visited.saturating_add(1);
+        let mut child = arena.node(index).map_or(NO_INDEX, |node| node.first_child);
+        while child != NO_INDEX {
+            stack.push(child);
+            child = arena.node(child).map_or(NO_INDEX, |node| node.next_sibling);
+        }
+    }
+    ensure_query_active(cancel)
+}
+
+fn ensure_query_active(cancel: &AtomicBool) -> Result<(), ScanFailure> {
+    if cancel.load(AtomicOrdering::Acquire) {
+        Err(ScanFailure::new(
+            "QUERY_CANCELLED",
+            "The analyzer query was cancelled",
+            true,
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_query_id(query_id: Option<&str>) -> Result<(), ScanFailure> {
+    if query_id.is_some_and(|value| {
+        value.is_empty()
+            || value.len() > 128
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    }) {
+        return Err(ScanFailure::new(
+            "INVALID_QUERY",
+            "query_id must contain 1-128 ASCII letters, digits, dashes, or underscores",
+            true,
+        ));
+    }
+    Ok(())
+}
+
+fn query_cursor(arena: &ScanArena, signature: u64, offset: usize) -> String {
+    format!("{}:q:{signature:016x}:{offset}", arena.session_id())
+}
+
+fn parse_query_cursor(
+    arena: &ScanArena,
+    cursor: &str,
+    expected_signature: u64,
+) -> Result<usize, ScanFailure> {
+    let prefix = format!("{}:q:", arena.session_id());
+    let value = cursor.strip_prefix(&prefix).ok_or_else(stale_session)?;
+    let (signature, offset) = value.split_once(':').ok_or_else(invalid_cursor)?;
+    let signature = u64::from_str_radix(signature, 16).map_err(|_| invalid_cursor())?;
+    if signature != expected_signature {
+        return Err(ScanFailure::new(
+            "INVALID_CURSOR",
+            "The query cursor belongs to different filters or sorting",
+            true,
+        ));
+    }
+    offset.parse().map_err(|_| invalid_cursor())
+}
+
+fn invalid_cursor() -> ScanFailure {
+    ScanFailure::new("INVALID_CURSOR", "The query cursor is malformed", true)
+}
+
+fn query_fingerprint(query: &ItemQuery, scope: u32) -> u64 {
+    let mut fingerprint = Fingerprint::default();
+    fingerprint.u64(u64::from(scope));
+    fingerprint.optional_string(query.text.as_deref());
+    fingerprint.optional_values(query.kinds.as_deref(), |fingerprint, value| {
+        fingerprint.byte(match value {
+            ItemKind::File => 0,
+            ItemKind::Directory => 1,
+            ItemKind::ReparsePoint => 2,
+        });
+    });
+    fingerprint.optional_strings(query.extensions.as_deref());
+    fingerprint.optional_values(query.policy_tiers.as_deref(), |fingerprint, value| {
+        fingerprint.byte(match value {
+            PolicyTier::Protected => 0,
+            PolicyTier::ReviewRequired => 1,
+            PolicyTier::CleanupCandidate => 2,
+        });
+    });
+    fingerprint.optional_strings(query.owner_ids.as_deref());
+    fingerprint.optional_string(query.min_bytes.as_deref());
+    fingerprint.optional_string(query.modified_before_ms.as_deref());
+    fingerprint.byte(match query.sort {
+        ItemSort::Name => 0,
+        ItemSort::Allocated => 1,
+        ItemSort::Logical => 2,
+        ItemSort::Modified => 3,
+        ItemSort::Type => 4,
+        ItemSort::Policy => 5,
+        ItemSort::Owner => 6,
+    });
+    fingerprint.byte(match query.direction {
+        SortDirection::Asc => 0,
+        SortDirection::Desc => 1,
+    });
+    fingerprint.0
+}
+
+struct Fingerprint(u64);
+
+impl Default for Fingerprint {
+    fn default() -> Self {
+        Self(0xcbf2_9ce4_8422_2325)
+    }
+}
+
+impl Fingerprint {
+    fn byte(&mut self, byte: u8) {
+        self.0 ^= u64::from(byte);
+        self.0 = self.0.wrapping_mul(0x100_0000_01b3);
+    }
+
+    fn bytes(&mut self, bytes: &[u8]) {
+        self.u64(bytes.len() as u64);
+        for byte in bytes {
+            self.byte(*byte);
+        }
+    }
+
+    fn u64(&mut self, value: u64) {
+        for byte in value.to_le_bytes() {
+            self.byte(byte);
+        }
+    }
+
+    fn optional_string(&mut self, value: Option<&str>) {
+        match value {
+            Some(value) => {
+                self.byte(1);
+                self.bytes(value.as_bytes());
+            }
+            None => self.byte(0),
+        }
+    }
+
+    fn optional_strings(&mut self, values: Option<&[String]>) {
+        self.optional_values(values, |fingerprint, value| {
+            fingerprint.bytes(value.as_bytes());
+        });
+    }
+
+    fn optional_values<T>(&mut self, values: Option<&[T]>, mut write: impl FnMut(&mut Self, &T)) {
+        match values {
+            Some(values) => {
+                self.byte(1);
+                self.u64(values.len() as u64);
+                for value in values {
+                    write(self, value);
+                }
+            }
+            None => self.byte(0),
+        }
+    }
 }
 
 fn validate_decimal_filter(value: Option<&str>, field: &str) -> Result<(), ScanFailure> {
@@ -1251,9 +1803,10 @@ struct BucketAccumulator {
     allocated: u64,
 }
 
-#[derive(Default)]
-struct Opportunity {
-    nodes: Vec<u32>,
+struct PlanOpportunity {
+    index: u32,
+    rule: Rule,
+    owner: u32,
     bytes: u64,
 }
 
@@ -1265,7 +1818,9 @@ mod tests {
         arena::{ArenaBuilder, DiscoveredEntry, NO_INDEX},
         scan::{AggregateDimension, ItemSort, SortDirection},
     };
-    use clutter_protocol::{RAW_NODE_FLAG_DIRECTORY, RawArenaNode, RawArenaSnapshot};
+    use clutter_protocol::{
+        RAW_NODE_FLAG_DIRECTORY, RAW_NODE_FLAG_ENCRYPTED, RawArenaNode, RawArenaSnapshot,
+    };
 
     use super::*;
 
@@ -1290,6 +1845,76 @@ mod tests {
     }
 
     #[test]
+    fn cursor_is_bound_to_session_scope_filters_and_sorting() -> Result<(), ScanFailure> {
+        let (arena, analyzer) = fixture(ScanCoverage::Complete)?;
+        let mut query = ItemQuery {
+            limit: 1,
+            ..ItemQuery::default()
+        };
+        let first = analyzer.query(&arena, &query)?;
+        let cursor = first.next_cursor.expect("fixture has a second root child");
+        query.cursor = Some(cursor.clone());
+        let second = analyzer.query(&arena, &query)?;
+        assert_ne!(first.items[0].id, second.items[0].id);
+
+        query.sort = ItemSort::Allocated;
+        let error = analyzer
+            .query(&arena, &query)
+            .expect_err("a cursor cannot be reused after sorting changes");
+        assert_eq!(error.code, "INVALID_CURSOR");
+
+        let stale_arena =
+            ArenaBuilder::new(PathBuf::from("C:\\"))?.finish("different-session".to_owned());
+        let error = analyzer
+            .query(
+                &stale_arena,
+                &ItemQuery {
+                    cursor: Some(cursor),
+                    ..ItemQuery::default()
+                },
+            )
+            .expect_err("a cursor cannot cross scan sessions");
+        assert_eq!(error.code, "STALE_SESSION");
+        Ok(())
+    }
+
+    #[test]
+    fn recursive_queries_observe_cancellation() -> Result<(), ScanFailure> {
+        let (arena, analyzer) = fixture(ScanCoverage::Complete)?;
+        let cancel = AtomicBool::new(true);
+        let error = analyzer
+            .query_cancellable(
+                &arena,
+                &ItemQuery {
+                    text: Some("cache".to_owned()),
+                    query_id: Some("cancel-fixture".to_owned()),
+                    ..ItemQuery::default()
+                },
+                &cancel,
+            )
+            .expect_err("cancelled queries must not return results");
+
+        assert_eq!(error.code, "QUERY_CANCELLED");
+        Ok(())
+    }
+
+    #[test]
+    fn direct_sort_cache_is_reused_and_invalidated_by_policy_changes() -> Result<(), ScanFailure> {
+        let (arena, mut analyzer) = fixture(ScanCoverage::Complete)?;
+        let query = ItemQuery {
+            sort: ItemSort::Policy,
+            ..ItemQuery::default()
+        };
+        analyzer.query(&arena, &query)?;
+        analyzer.query(&arena, &query)?;
+        assert_eq!(analyzer.sort_cache.lock().unwrap().entries.len(), 1);
+
+        analyzer.apply_settings(&arena, &AnalyzerSettings::default());
+        assert!(analyzer.sort_cache.lock().unwrap().entries.is_empty());
+        Ok(())
+    }
+
+    #[test]
     fn system_protection_precedes_generated_directory_review() {
         let node = ArenaNode {
             flags: RAW_NODE_FLAG_DIRECTORY,
@@ -1306,6 +1931,55 @@ mod tests {
             ),
             Rule::System
         );
+    }
+
+    #[test]
+    fn policy_matrix_keeps_unsafe_content_out_of_cleanup_candidates() {
+        let plain = ArenaNode::default();
+        let encrypted = ArenaNode {
+            flags: RAW_NODE_FLAG_ENCRYPTED,
+            ..ArenaNode::default()
+        };
+        let cases = [
+            (
+                r"c:\users\tester\appdata\local\temp\secret.bin",
+                "secret.bin",
+                &encrypted,
+                Rule::EncryptedData,
+            ),
+            (
+                r"c:\users\tester\backups\disk.vhdx",
+                "disk.vhdx",
+                &plain,
+                Rule::BackupData,
+            ),
+            (
+                r"c:\programdata\microsoft\windows\wer\reportqueue\report.wer",
+                "report.wer",
+                &plain,
+                Rule::WindowsManagedCleanup,
+            ),
+            (
+                r"c:\users\tester\appdata\local\npm-cache\_cacache\content",
+                "content",
+                &plain,
+                Rule::NpmCache,
+            ),
+            (
+                r"c:\users\tester\appdata\local\npm-cache\_logs\debug.log",
+                "debug.log",
+                &plain,
+                Rule::NpmLogs,
+            ),
+        ];
+
+        for (path, name, node, expected) in cases {
+            assert_eq!(
+                classify(path, name, node, Rule::Unknown, NO_OWNER, &[]),
+                expected,
+                "unexpected rule for {path}"
+            );
+        }
     }
 
     #[test]
@@ -1429,6 +2103,41 @@ mod tests {
     }
 
     #[test]
+    fn ntfs_protection_uses_volume_identity_and_relative_path() -> Result<(), ScanFailure> {
+        let (arena, mut analyzer) = fixture(ScanCoverage::Complete)?;
+        let cache_id = arena.node_id(2);
+        let key = analyzer.protection_key(&arena, &cache_id)?;
+        assert!(matches!(
+            &key,
+            ProtectedPath::Identified {
+                volume_id,
+                relative_path
+            } if volume_id == r"\\?\volume{fixture}\" && relative_path.ends_with(r"\temp\cache")
+        ));
+        analyzer.apply_settings(
+            &arena,
+            &AnalyzerSettings {
+                protected_paths: vec![key.clone()],
+                dismissed_suggestions: Vec::new(),
+            },
+        );
+        assert_eq!(analyzer.effective_tier(2), PolicyTier::Protected);
+
+        let mut other_target = fixture_target();
+        other_target.volume_id = Some(r"\\?\Volume{other}\".to_owned());
+        let mut other_volume = AnalyzerIndex::build(&arena, ScanCoverage::Complete, &other_target);
+        other_volume.apply_settings(
+            &arena,
+            &AnalyzerSettings {
+                protected_paths: vec![key],
+                dismissed_suggestions: Vec::new(),
+            },
+        );
+        assert_eq!(other_volume.effective_tier(2), PolicyTier::CleanupCandidate);
+        Ok(())
+    }
+
+    #[test]
     fn plan_edits_recompute_review_totals() -> Result<(), ScanFailure> {
         let (arena, analyzer) = fixture(ScanCoverage::Complete)?;
         let mut plan = analyzer.build_plan(&arena, &CleanupPlanRequest { target_bytes: None })?;
@@ -1448,6 +2157,28 @@ mod tests {
         )?;
         assert_eq!(plan.selected_candidate_bytes, "100");
         assert_eq!(plan.selected_review_bytes, "200");
+        Ok(())
+    }
+
+    #[test]
+    fn cleanup_plan_is_bounded_and_reports_omitted_totals() -> Result<(), ScanFailure> {
+        let mut builder = ArenaBuilder::new(PathBuf::from(r"C:\Users\tester\source"))?;
+        for index in 1..=MAX_PLAN_ITEMS as u32 + 25 {
+            builder.push(file(index, 0, &format!("node_modules-{index}"), 1))?;
+        }
+        let arena = builder.finish("bounded-plan".to_owned());
+        let mut analyzer = AnalyzerIndex::build(&arena, ScanCoverage::Complete, &fixture_target());
+        for index in 1..arena.node_count() as u32 {
+            analyzer.rules[index as usize] = Rule::GeneratedProjectData;
+        }
+
+        let plan = analyzer.build_plan(&arena, &CleanupPlanRequest { target_bytes: None })?;
+
+        assert_eq!(plan.items.len(), MAX_PLAN_ITEMS);
+        assert!(plan.truncated);
+        assert_eq!(plan.omitted_item_count, "25");
+        assert_eq!(plan.omitted_review_bytes, "25");
+        assert!(plan.items.iter().all(|item| item.node_ids.len() == 1));
         Ok(())
     }
 
@@ -1496,7 +2227,7 @@ mod tests {
             RawArenaSnapshot { nodes, names },
         )?;
         let started = std::time::Instant::now();
-        let analyzer = AnalyzerIndex::build(&arena, ScanCoverage::Complete);
+        let mut analyzer = AnalyzerIndex::build(&arena, ScanCoverage::Complete, &fixture_target());
         let classify_ms = started.elapsed().as_millis();
         let combined = arena
             .estimated_memory_bytes()
@@ -1512,15 +2243,74 @@ mod tests {
                 ..ItemQuery::default()
             },
         )?;
+        let first_search_ms = query_started.elapsed().as_millis();
+        let navigation_started = std::time::Instant::now();
+        analyzer.query(
+            &arena,
+            &ItemQuery {
+                sort: ItemSort::Name,
+                limit: 50,
+                ..ItemQuery::default()
+            },
+        )?;
+        let first_navigation_ms = navigation_started.elapsed().as_millis();
+        let cached_navigation_started = std::time::Instant::now();
+        analyzer.query(
+            &arena,
+            &ItemQuery {
+                sort: ItemSort::Name,
+                limit: 50,
+                ..ItemQuery::default()
+            },
+        )?;
+        let cached_navigation_ms = cached_navigation_started.elapsed().as_millis();
+        let aggregate_started = std::time::Instant::now();
+        analyzer.aggregate(
+            &arena,
+            &StorageAggregateQuery {
+                scope_id: None,
+                dimension: AggregateDimension::Extension,
+                limit: 50,
+            },
+        )?;
+        let aggregate_ms = aggregate_started.elapsed().as_millis();
+        let treemap_started = std::time::Instant::now();
+        analyzer.treemap(
+            &arena,
+            &TreemapQuery {
+                scope_id: None,
+                max_nodes: 5_000,
+            },
+        )?;
+        let treemap_ms = treemap_started.elapsed().as_millis();
+        let combined_after_first_view = arena
+            .estimated_memory_bytes()
+            .saturating_add(analyzer.estimated_memory_bytes());
+        analyzer.rules[1..].fill(Rule::GeneratedProjectData);
+        let plan_started = std::time::Instant::now();
+        let plan = analyzer.build_plan(&arena, &CleanupPlanRequest { target_bytes: None })?;
+        let plan_ms = plan_started.elapsed().as_millis();
         println!(
-            "entries={} combined_bytes={} classify_ms={} first_search_ms={}",
+            "entries={} combined_bytes={} first_view_bytes={} classify_ms={} first_search_ms={} first_navigation_ms={} cached_navigation_ms={} aggregate_ms={} treemap_ms={} plan_ms={}",
             arena.entry_count(),
             combined,
+            combined_after_first_view,
             classify_ms,
-            query_started.elapsed().as_millis()
+            first_search_ms,
+            first_navigation_ms,
+            cached_navigation_ms,
+            aggregate_ms,
+            treemap_ms,
+            plan_ms,
         );
         assert!(combined <= RUST_BUDGET);
+        assert!(combined_after_first_view <= RUST_BUDGET);
         assert_eq!(page.items.len(), 50);
+        assert_eq!(plan.items.len(), MAX_PLAN_ITEMS);
+        assert!(plan.truncated);
+        assert!(first_search_ms < 300);
+        assert!(cached_navigation_ms < 100);
+        assert!(treemap_ms < 500);
         Ok(())
     }
 
@@ -1534,7 +2324,7 @@ mod tests {
         builder.push(file(5, 4, "package.bin", 200))?;
         builder.push(file(6, 1, "photo.jpg", 50))?;
         let arena = builder.finish("analyzer-fixture".to_owned());
-        let analyzer = AnalyzerIndex::build(&arena, coverage);
+        let analyzer = AnalyzerIndex::build(&arena, coverage, &fixture_target());
         Ok((arena, analyzer))
     }
 
@@ -1546,6 +2336,10 @@ mod tests {
             is_directory: true,
             is_reparse_point: false,
             inaccessible: false,
+            is_sparse: false,
+            is_compressed: false,
+            is_encrypted: false,
+            has_named_stream: false,
             logical_bytes: 0,
             allocated_bytes: 0,
             modified_at_ms: None,
@@ -1560,6 +2354,19 @@ mod tests {
             logical_bytes: bytes,
             allocated_bytes: bytes,
             ..directory(id, parent, name)
+        }
+    }
+
+    fn fixture_target() -> ScanTarget {
+        ScanTarget {
+            id: "fixture-volume".to_owned(),
+            kind: crate::scan::ScanTargetKind::Volume,
+            display_path: "C:\\".to_owned(),
+            filesystem: Some("NTFS".to_owned()),
+            volume_id: Some(r"\\?\Volume{fixture}\".to_owned()),
+            total_bytes: None,
+            available_bytes: None,
+            fast_scan_available: true,
         }
     }
 }

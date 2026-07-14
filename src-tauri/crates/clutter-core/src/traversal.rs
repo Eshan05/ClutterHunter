@@ -388,6 +388,7 @@ fn scan_directory(
         };
         let modified_at_ms = metadata.modified().ok().and_then(system_time_ms);
         let hard_link_count = identity.map(|identity| identity.links);
+        let (is_sparse, is_compressed, is_encrypted) = storage_attributes(&metadata);
 
         emit_event(
             event_tx,
@@ -400,6 +401,10 @@ fn scan_directory(
                     is_directory,
                     is_reparse_point,
                     inaccessible: false,
+                    is_sparse,
+                    is_compressed,
+                    is_encrypted,
+                    has_named_stream: false,
                     logical_bytes,
                     allocated_bytes,
                     modified_at_ms,
@@ -521,6 +526,26 @@ fn is_windows_reparse_point(metadata: &fs::Metadata) -> bool {
     use windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
 
     metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0
+}
+
+#[cfg(windows)]
+fn storage_attributes(metadata: &fs::Metadata) -> (bool, bool, bool) {
+    use std::os::windows::fs::MetadataExt as _;
+    use windows::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_COMPRESSED, FILE_ATTRIBUTE_ENCRYPTED, FILE_ATTRIBUTE_SPARSE_FILE,
+    };
+
+    let attributes = metadata.file_attributes();
+    (
+        attributes & FILE_ATTRIBUTE_SPARSE_FILE.0 != 0,
+        attributes & FILE_ATTRIBUTE_COMPRESSED.0 != 0,
+        attributes & FILE_ATTRIBUTE_ENCRYPTED.0 != 0,
+    )
+}
+
+#[cfg(not(windows))]
+fn storage_attributes(_metadata: &fs::Metadata) -> (bool, bool, bool) {
+    (false, false, false)
 }
 
 #[cfg(not(windows))]

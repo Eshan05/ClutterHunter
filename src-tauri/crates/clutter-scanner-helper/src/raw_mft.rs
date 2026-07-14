@@ -6,36 +6,36 @@ use std::{
     fs::{File, OpenOptions},
     io::{Read, Seek, SeekFrom},
     os::windows::io::AsRawHandle as _,
-    sync::mpsc::{Receiver, SyncSender, sync_channel},
+    sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel},
     thread,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use bytemuck::{Pod, Zeroable, cast_slice_mut};
 use clutter_protocol::{
-    RAW_NODE_FLAG_DIRECTORY, RAW_NODE_FLAG_HARD_LINK_ALIAS, RAW_NODE_FLAG_REPARSE_POINT,
-    RAW_NODE_NO_INDEX, RawArenaNode, RawArenaSnapshot, RawScanPhase, RawScanStatistics,
-    RawScanWarning,
+    RAW_NODE_FLAG_COMPRESSED, RAW_NODE_FLAG_DIRECTORY, RAW_NODE_FLAG_ENCRYPTED,
+    RAW_NODE_FLAG_HARD_LINK_ALIAS, RAW_NODE_FLAG_NAMED_STREAM, RAW_NODE_FLAG_REPARSE_POINT,
+    RAW_NODE_FLAG_SPARSE, RAW_NODE_NO_INDEX, RawArenaNode, RawArenaSnapshot, RawScanPhase,
+    RawScanStatistics, RawScanWarning,
 };
 use rayon::prelude::*;
 use smallvec::SmallVec;
 use windows::Win32::{
-    Foundation::{CloseHandle, ERROR_IO_PENDING, HANDLE, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT},
+    Foundation::HANDLE,
     System::{
-        IO::{CancelIoEx, DeviceIoControl, GetOverlappedResult, OVERLAPPED},
+        IO::DeviceIoControl,
         Ioctl::{FSCTL_QUERY_USN_JOURNAL, USN_JOURNAL_DATA_V0},
-        Threading::{CreateEventW, WaitForSingleObject},
     },
 };
-use windows::core::{HRESULT, PCWSTR};
 
 const CHUNK_SIZE: usize = 4 * 1024 * 1024;
 const BUFFER_COUNT: usize = 4;
 const PAGE_SIZE: usize = 4096;
+const OWNER_CHUNK_CAPACITY: usize = 32 * 1024;
+const FILE_FLAG_NO_BUFFERING: u32 = 0x2000_0000;
+const FILE_FLAG_SEQUENTIAL_SCAN: u32 = 0x0800_0000;
 const FIRST_NORMAL_RECORD: u64 = 24;
 const ROOT_RECORD: u64 = 5;
-const FILE_FLAG_OVERLAPPED: u32 = 0x4000_0000;
-const FILE_FLAG_SEQUENTIAL_SCAN: u32 = 0x0800_0000;
 const JOURNAL_QUERY_TIMEOUT_MS: u32 = 500;
 const FILE_REFERENCE_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
 const WINDOWS_EPOCH_DIFFERENCE_100NS: u64 = 116_444_736_000_000_000;
@@ -61,17 +61,23 @@ struct JournalPosition {
 pub fn scan(
     target: &str,
     is_cancelled: impl Fn() -> bool,
-    mut on_progress: impl FnMut(RawScanPhase, u64, u64, u64) -> Result<(), String>,
+    mut on_progress: impl FnMut(RawScanPhase, u64, u64, u64, u64) -> Result<(), String>,
 ) -> Result<ScanProduct, String> {
     let started = Instant::now();
     let scan_target = parse_scan_target(target)?;
-    on_progress(RawScanPhase::Preparing, 0, 0, elapsed_ms(started))?;
+    on_progress(RawScanPhase::Preparing, 0, 0, 0, elapsed_ms(started))?;
     let volume_path = raw_volume_path(&scan_target.volume_root)?;
-    let mut volume = open_volume(&volume_path).map_err(|error| error.to_string())?;
-    let journal_start = query_usn_journal(&volume_path);
-    let geometry = read_geometry(&mut volume).map_err(|error| error.to_string())?;
+    let mut reader = open_ingest_volume(&volume_path)
+        .map_err(|error| format!("could not open the raw NTFS data handle: {error}"))?;
+    on_progress(RawScanPhase::ReadingMetadata, 0, 0, 0, elapsed_ms(started))?;
+    let mut metadata = open_volume(&volume_path)
+        .map_err(|error| format!("could not open the NTFS metadata handle: {error}"))?;
+    on_progress(RawScanPhase::CheckingJournal, 0, 0, 0, elapsed_ms(started))?;
+    let journal_start = query_usn_journal(&metadata);
+    on_progress(RawScanPhase::ReadingMetadata, 0, 0, 0, elapsed_ms(started))?;
+    let geometry = read_geometry(&mut metadata).map_err(|error| error.to_string())?;
     let (runs, mft_length) =
-        read_mft_layout(&mut volume, geometry).map_err(|error| error.to_string())?;
+        read_mft_layout(&mut metadata, geometry).map_err(|error| error.to_string())?;
     let run_count = runs.len() as u64;
     let max_records = mft_length / geometry.record_size;
     if max_records == 0 || max_records > 50_000_000 {
@@ -81,6 +87,7 @@ pub fn scan(
         RawScanPhase::Preparing,
         max_records,
         mft_length,
+        0,
         elapsed_ms(started),
     )?;
     if is_cancelled() {
@@ -94,11 +101,10 @@ pub fn scan(
             .map_err(|error| error.to_string())?;
     }
     let (sender, receiver) = sync_channel::<ChunkMessage>(BUFFER_COUNT);
-    let reader = volume;
     let ingest_started = Instant::now();
     let producer = thread::spawn(move || {
         produce_chunks(
-            reader,
+            &mut reader,
             runs,
             geometry.cluster_size,
             geometry.record_size,
@@ -112,18 +118,26 @@ pub fn scan(
         receiver,
         empty_sender,
         geometry,
-        max_records as usize,
+        ConsumeOptions {
+            max_records: max_records as usize,
+            report_allocated_progress: scan_target.components.is_empty(),
+        },
         &is_cancelled,
         &started,
         &mut on_progress,
     );
-    let _ = producer.join();
-    let (owners, invalid_records, parsed_records, named_streams, attribute_lists) = parse_result?;
+    producer
+        .join()
+        .map_err(|_| "the MFT reader stopped unexpectedly".to_owned())?;
+    let journal_end = query_usn_journal(&metadata);
+    let (owners, invalid_records, parsed_records, named_streams, attribute_lists, allocated_bytes) =
+        parse_result?;
     let ingest_ms = elapsed_ms(ingest_started);
     on_progress(
         RawScanPhase::Indexing,
         parsed_records,
         mft_length,
+        allocated_bytes,
         elapsed_ms(started),
     )?;
     if is_cancelled() {
@@ -145,7 +159,6 @@ pub fn scan(
     product.statistics.mft_data_runs = run_count;
     product.statistics.ingest_ms = ingest_ms;
     product.statistics.elapsed_ms = elapsed_ms(started);
-    let journal_end = query_usn_journal(&volume_path);
     record_journal_positions(
         &mut product.statistics,
         journal_start.as_ref().ok().copied(),
@@ -165,6 +178,7 @@ pub fn scan(
         RawScanPhase::Finalizing,
         product.statistics.entry_count,
         mft_length,
+        product.statistics.allocated_bytes,
         product.statistics.elapsed_ms,
     )?;
     Ok(product)
@@ -174,23 +188,30 @@ fn elapsed_ms(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
-fn query_usn_journal(volume_path: &str) -> Result<JournalPosition, String> {
-    let volume = open_overlapped_volume(volume_path)
-        .map_err(|error| format!("could not open the volume for a journal query: {error}"))?;
+fn query_usn_journal(volume: &File) -> Result<JournalPosition, String> {
+    let volume = volume
+        .try_clone()
+        .map_err(|error| format!("could not duplicate the volume journal handle: {error}"))?;
+    let (sender, receiver) = sync_channel(1);
+    thread::spawn(move || {
+        let _ = sender.send(query_usn_journal_sync(volume));
+    });
+    match receiver.recv_timeout(Duration::from_millis(JOURNAL_QUERY_TIMEOUT_MS.into())) {
+        Ok(result) => result,
+        Err(RecvTimeoutError::Timeout) => Err("the NTFS change journal query timed out".to_owned()),
+        Err(RecvTimeoutError::Disconnected) => {
+            Err("the NTFS change journal query worker stopped unexpectedly".to_owned())
+        }
+    }
+}
+
+fn query_usn_journal_sync(volume: File) -> Result<JournalPosition, String> {
     let handle = HANDLE(volume.as_raw_handle());
-    let event = JournalEvent(
-        unsafe { CreateEventW(None, true, false, PCWSTR::null()) }
-            .map_err(|error| format!("could not create the journal query event: {error}"))?,
-    );
-    let mut overlapped = OVERLAPPED {
-        hEvent: event.0,
-        ..OVERLAPPED::default()
-    };
     let mut data = USN_JOURNAL_DATA_V0::default();
     let mut returned = 0u32;
     let output_size = u32::try_from(std::mem::size_of::<USN_JOURNAL_DATA_V0>())
         .map_err(|_| "the USN journal response size overflowed".to_owned())?;
-    let result = unsafe {
+    unsafe {
         DeviceIoControl(
             handle,
             FSCTL_QUERY_USN_JOURNAL,
@@ -199,30 +220,10 @@ fn query_usn_journal(volume_path: &str) -> Result<JournalPosition, String> {
             Some(std::ptr::addr_of_mut!(data).cast()),
             output_size,
             Some(&mut returned),
-            Some(&mut overlapped),
+            None,
         )
-    };
-    if let Err(error) = result {
-        if error.code() != HRESULT::from_win32(ERROR_IO_PENDING.0) {
-            return Err(format!("could not query the NTFS change journal: {error}"));
-        }
-        match unsafe { WaitForSingleObject(event.0, JOURNAL_QUERY_TIMEOUT_MS) } {
-            WAIT_OBJECT_0 => {
-                unsafe { GetOverlappedResult(handle, &overlapped, &mut returned, false) }.map_err(
-                    |error| format!("could not finish the NTFS change journal query: {error}"),
-                )?
-            }
-            WAIT_TIMEOUT => {
-                let _ = unsafe { CancelIoEx(handle, Some(&overlapped)) };
-                let _ = unsafe { WaitForSingleObject(event.0, u32::MAX) };
-                return Err("the NTFS change journal query timed out".to_owned());
-            }
-            WAIT_FAILED => return Err("waiting for the NTFS change journal failed".to_owned()),
-            _ => {
-                return Err("the NTFS change journal returned an unexpected wait status".to_owned());
-            }
-        }
     }
+    .map_err(|error| format!("could not query the NTFS change journal: {error}"))?;
     if returned < output_size {
         return Err("the NTFS change journal returned an incomplete response".to_owned());
     }
@@ -230,14 +231,6 @@ fn query_usn_journal(volume_path: &str) -> Result<JournalPosition, String> {
         id: data.UsnJournalID,
         next_usn: data.NextUsn,
     })
-}
-
-struct JournalEvent(HANDLE);
-
-impl Drop for JournalEvent {
-    fn drop(&mut self) {
-        let _ = unsafe { CloseHandle(self.0) };
-    }
 }
 
 fn record_journal_positions(
@@ -295,9 +288,18 @@ struct OwnerAccumulator {
     link_count: u32,
     logical_bytes: u64,
     allocated_bytes: u64,
+    has_unnamed_data: bool,
+    named_logical_bytes: u64,
+    named_allocated_bytes: u64,
     fallback_logical_bytes: u64,
     fallback_allocated_bytes: u64,
-    links: SmallVec<[LinkCandidate; 1]>,
+    is_sparse: bool,
+    is_compressed: bool,
+    is_encrypted: bool,
+    has_named_stream: bool,
+    first_link_plus_one: u32,
+    last_link_plus_one: u32,
+    path_link_count: u32,
 }
 
 struct RecordFragment {
@@ -309,8 +311,14 @@ struct RecordFragment {
     link_count: u32,
     logical_bytes: u64,
     allocated_bytes: u64,
+    has_unnamed_data: bool,
+    named_logical_bytes: u64,
+    named_allocated_bytes: u64,
     fallback_logical_bytes: u64,
     fallback_allocated_bytes: u64,
+    is_sparse: bool,
+    is_compressed: bool,
+    is_encrypted: bool,
     links: SmallVec<[LinkCandidate; 1]>,
     named_streams: u64,
     has_attribute_list: bool,
@@ -326,6 +334,15 @@ enum ParsedRecord {
 struct LinkCandidate {
     parent_record_id: u64,
     name: String,
+    namespace: u8,
+}
+
+#[derive(Clone, Copy)]
+struct OwnerLink {
+    parent_record_id: u32,
+    name_offset: u32,
+    next_plus_one: u32,
+    name_length: u16,
     namespace: u8,
 }
 
@@ -349,20 +366,20 @@ fn open_volume(path: &str) -> std::io::Result<File> {
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt as _;
-        options
-            .share_mode(7)
-            .custom_flags(FILE_FLAG_SEQUENTIAL_SCAN);
+        options.share_mode(7);
     }
     options.open(path)
 }
 
-fn open_overlapped_volume(path: &str) -> std::io::Result<File> {
+fn open_ingest_volume(path: &str) -> std::io::Result<File> {
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt as _;
-        options.share_mode(7).custom_flags(FILE_FLAG_OVERLAPPED);
+        options
+            .share_mode(7)
+            .custom_flags(FILE_FLAG_NO_BUFFERING | FILE_FLAG_SEQUENTIAL_SCAN);
     }
     options.open(path)
 }
@@ -450,7 +467,7 @@ fn read_mft_layout(
 }
 
 fn produce_chunks(
-    mut volume: File,
+    volume: &mut File,
     runs: Vec<DataRun>,
     cluster_size: u64,
     record_size: u64,
@@ -515,24 +532,166 @@ fn produce_chunks(
 }
 
 type OwnerRow = (u64, OwnerAccumulator);
-type ConsumeProduct = (Vec<OwnerRow>, u64, u64, u64, u64);
+
+#[derive(Default)]
+struct OwnerTable {
+    chunks: Vec<Vec<OwnerRow>>,
+    links: Vec<OwnerLink>,
+    names: Vec<u8>,
+    len: usize,
+}
+
+impl OwnerTable {
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn push(&mut self, row: OwnerRow) {
+        if self
+            .chunks
+            .last()
+            .is_none_or(|chunk| chunk.len() == OWNER_CHUNK_CAPACITY)
+        {
+            self.chunks.push(Vec::with_capacity(OWNER_CHUNK_CAPACITY));
+        }
+        self.chunks
+            .last_mut()
+            .expect("an owner chunk was created above")
+            .push(row);
+        self.len = self.len.saturating_add(1);
+    }
+
+    fn get_mut(&mut self, index: u32) -> Option<&mut OwnerRow> {
+        let index = index as usize;
+        self.chunks
+            .get_mut(index / OWNER_CHUNK_CAPACITY)?
+            .get_mut(index % OWNER_CHUNK_CAPACITY)
+    }
+
+    fn add_links(
+        &mut self,
+        owner_index: u32,
+        candidates: impl IntoIterator<Item = LinkCandidate>,
+    ) -> Result<(), String> {
+        let mut first_plus_one = 0u32;
+        let mut last_plus_one = 0u32;
+        let mut count = 0u32;
+        for candidate in candidates {
+            let name_offset = u32::try_from(self.names.len())
+                .map_err(|_| "the owner name pool exceeded its 32-bit limit")?;
+            let name_length = u16::try_from(candidate.name.len())
+                .map_err(|_| "an MFT filename exceeded its supported length")?;
+            let parent_record_id = u32::try_from(candidate.parent_record_id)
+                .map_err(|_| "an MFT parent record exceeded its supported range")?;
+            self.names.extend_from_slice(candidate.name.as_bytes());
+            let link_index = u32::try_from(self.links.len())
+                .map_err(|_| "the owner link table exceeded its 32-bit limit")?;
+            let link_plus_one = link_index
+                .checked_add(1)
+                .ok_or_else(|| "the owner link table exceeded its 32-bit limit".to_owned())?;
+            self.links.push(OwnerLink {
+                parent_record_id,
+                name_offset,
+                next_plus_one: 0,
+                name_length,
+                namespace: candidate.namespace,
+            });
+            if last_plus_one == 0 {
+                first_plus_one = link_plus_one;
+            } else {
+                self.links[(last_plus_one - 1) as usize].next_plus_one = link_plus_one;
+            }
+            last_plus_one = link_plus_one;
+            count = count.saturating_add(1);
+        }
+        if first_plus_one == 0 {
+            return Ok(());
+        }
+
+        let existing_last = self
+            .get_mut(owner_index)
+            .ok_or_else(|| "a stored owner index did not resolve".to_owned())?
+            .1
+            .last_link_plus_one;
+        if existing_last != 0 {
+            self.links[(existing_last - 1) as usize].next_plus_one = first_plus_one;
+        }
+        let owner = &mut self
+            .get_mut(owner_index)
+            .expect("the owner index resolved above")
+            .1;
+        if owner.first_link_plus_one == 0 {
+            owner.first_link_plus_one = first_plus_one;
+        }
+        owner.last_link_plus_one = last_plus_one;
+        owner.path_link_count = owner.path_link_count.saturating_add(count);
+        Ok(())
+    }
+
+    fn normalize_all_links(&mut self) {
+        let Self {
+            chunks,
+            links,
+            names,
+            ..
+        } = self;
+        for chunk in chunks {
+            for (_, owner) in chunk {
+                normalize_owner_links(owner, links, names);
+            }
+        }
+    }
+
+    fn arena_capacity(&self) -> (usize, usize) {
+        let mut entries = 0usize;
+        let mut name_bytes = 0usize;
+        for (_, owner) in self.chunks.iter().flat_map(|chunk| chunk.iter()) {
+            if !owner.seen_base || owner.path_link_count == 0 {
+                continue;
+            }
+            entries = entries.saturating_add(owner.path_link_count as usize);
+            let mut link_plus_one = owner.first_link_plus_one;
+            for _ in 0..owner.path_link_count {
+                if link_plus_one == 0 {
+                    break;
+                }
+                let link = self.links[(link_plus_one - 1) as usize];
+                name_bytes = name_bytes.saturating_add(link.name_length as usize);
+                link_plus_one = link.next_plus_one;
+            }
+        }
+        (entries, name_bytes)
+    }
+
+    fn into_parts(self) -> (Vec<Vec<OwnerRow>>, Vec<OwnerLink>, Vec<u8>) {
+        (self.chunks, self.links, self.names)
+    }
+}
+
+type ConsumeProduct = (OwnerTable, u64, u64, u64, u64, u64);
+
+struct ConsumeOptions {
+    max_records: usize,
+    report_allocated_progress: bool,
+}
 
 fn consume_chunks(
     receiver: Receiver<ChunkMessage>,
     empty_sender: SyncSender<Vec<AlignedPage>>,
     geometry: VolumeGeometry,
-    max_records: usize,
+    options: ConsumeOptions,
     is_cancelled: &dyn Fn() -> bool,
     started: &Instant,
-    on_progress: &mut dyn FnMut(RawScanPhase, u64, u64, u64) -> Result<(), String>,
+    on_progress: &mut dyn FnMut(RawScanPhase, u64, u64, u64, u64) -> Result<(), String>,
 ) -> Result<ConsumeProduct, String> {
-    let mut owner_indices = vec![u32::MAX; max_records];
-    let mut owners = Vec::<OwnerRow>::with_capacity(max_records.min(8_000_000));
+    let mut owner_indices = vec![u32::MAX; options.max_records];
+    let mut owners = OwnerTable::default();
     let mut invalid_records = 0u64;
     let mut parsed_records = 0u64;
     let mut named_streams = 0u64;
     let mut attribute_lists = 0u64;
     let mut mft_bytes_read = 0u64;
+    let mut allocated_bytes = 0u64;
 
     while let Ok(message) = receiver.recv() {
         if is_cancelled() {
@@ -588,28 +747,53 @@ fn consume_chunks(
             } else {
                 *owner_index
             };
-            let owner = &mut owners[owner_index as usize].1;
-            owner.seen_base |= fragment.is_base;
-            if fragment.is_base {
-                owner.is_directory = fragment.is_directory;
-                owner.link_count = owner.link_count.max(fragment.link_count);
-                owner.modified_at_ms = fragment.modified_at_ms.or(owner.modified_at_ms);
+            {
+                let owner = &mut owners
+                    .get_mut(owner_index)
+                    .expect("a stored owner index must resolve")
+                    .1;
+                let previous_allocated = owner_allocated_bytes(owner);
+                owner.seen_base |= fragment.is_base;
+                if fragment.is_base {
+                    owner.is_directory = fragment.is_directory;
+                    owner.link_count = owner.link_count.max(fragment.link_count);
+                    owner.modified_at_ms = fragment.modified_at_ms.or(owner.modified_at_ms);
+                }
+                owner.is_reparse_point |= fragment.is_reparse_point;
+                owner.logical_bytes = owner.logical_bytes.max(fragment.logical_bytes);
+                owner.allocated_bytes = owner.allocated_bytes.max(fragment.allocated_bytes);
+                owner.has_unnamed_data |= fragment.has_unnamed_data;
+                owner.named_logical_bytes = owner
+                    .named_logical_bytes
+                    .saturating_add(fragment.named_logical_bytes);
+                owner.named_allocated_bytes = owner
+                    .named_allocated_bytes
+                    .saturating_add(fragment.named_allocated_bytes);
+                owner.fallback_logical_bytes = owner
+                    .fallback_logical_bytes
+                    .max(fragment.fallback_logical_bytes);
+                owner.fallback_allocated_bytes = owner
+                    .fallback_allocated_bytes
+                    .max(fragment.fallback_allocated_bytes);
+                owner.is_sparse |= fragment.is_sparse;
+                owner.is_compressed |= fragment.is_compressed;
+                owner.is_encrypted |= fragment.is_encrypted;
+                owner.has_named_stream |= fragment.named_streams > 0;
+                allocated_bytes = allocated_bytes
+                    .saturating_sub(previous_allocated)
+                    .saturating_add(owner_allocated_bytes(owner));
             }
-            owner.is_reparse_point |= fragment.is_reparse_point;
-            owner.logical_bytes = owner.logical_bytes.max(fragment.logical_bytes);
-            owner.allocated_bytes = owner.allocated_bytes.max(fragment.allocated_bytes);
-            owner.fallback_logical_bytes = owner
-                .fallback_logical_bytes
-                .max(fragment.fallback_logical_bytes);
-            owner.fallback_allocated_bytes = owner
-                .fallback_allocated_bytes
-                .max(fragment.fallback_allocated_bytes);
-            owner.links.extend(fragment.links);
+            owners.add_links(owner_index, fragment.links)?;
         }
         on_progress(
             RawScanPhase::Enumerating,
             parsed_records,
             mft_bytes_read,
+            if options.report_allocated_progress {
+                allocated_bytes
+            } else {
+                0
+            },
             elapsed_ms(*started),
         )?;
     }
@@ -620,7 +804,24 @@ fn consume_chunks(
         parsed_records,
         named_streams,
         attribute_lists,
+        if options.report_allocated_progress {
+            allocated_bytes
+        } else {
+            0
+        },
     ))
+}
+
+fn owner_allocated_bytes(owner: &OwnerAccumulator) -> u64 {
+    if owner.is_directory {
+        return 0;
+    }
+    (if owner.has_unnamed_data {
+        owner.allocated_bytes
+    } else {
+        owner.fallback_allocated_bytes
+    })
+    .saturating_add(owner.named_allocated_bytes)
 }
 
 fn parse_record(record_id: u64, record: &mut [u8], sector_size: usize) -> ParsedRecord {
@@ -644,19 +845,30 @@ fn parse_record(record_id: u64, record: &mut [u8], sector_size: usize) -> Parsed
     let mut links = SmallVec::new();
     let mut logical_bytes = 0u64;
     let mut allocated_bytes = 0u64;
+    let mut has_unnamed_data = false;
+    let mut named_logical_bytes = 0u64;
+    let mut named_allocated_bytes = 0u64;
     let mut fallback_logical_bytes = 0u64;
     let mut fallback_allocated_bytes = 0u64;
     let mut modified_at_ms = None;
     let mut is_reparse_point = false;
     let mut named_streams = 0u64;
     let mut has_attribute_list = false;
+    let mut is_sparse = false;
+    let mut is_compressed = false;
+    let mut is_encrypted = false;
 
     for attribute in parse_attributes(record) {
         match attribute.kind {
             0x10 if !attribute.non_resident => {
                 if let Some(value) = resident_value(attribute.bytes) {
                     modified_at_ms = read_u64(value, 8).and_then(nt_time_to_unix_ms);
-                    is_reparse_point |= read_u32(value, 32).is_some_and(|attrs| attrs & 0x400 != 0);
+                    if let Some(attributes) = read_u32(value, 32) {
+                        is_reparse_point |= attributes & 0x400 != 0;
+                        is_sparse |= attributes & 0x200 != 0;
+                        is_compressed |= attributes & 0x800 != 0;
+                        is_encrypted |= attributes & 0x4000 != 0;
+                    }
                 }
             }
             0x20 => has_attribute_list = true,
@@ -672,20 +884,36 @@ fn parse_record(record_id: u64, record: &mut [u8], sector_size: usize) -> Parsed
                     links.push(link);
                 }
             }
-            0x80 if attribute.name_length > 0 => {
-                named_streams = named_streams.saturating_add(1);
-            }
-            0x80 if attribute.non_resident => {
-                let lowest_vcn = read_u64(attribute.bytes, 16).unwrap_or(u64::MAX);
-                if lowest_vcn == 0 {
-                    logical_bytes = logical_bytes.max(read_u64(attribute.bytes, 48).unwrap_or(0));
-                    allocated_bytes =
-                        allocated_bytes.max(read_u64(attribute.bytes, 40).unwrap_or(0));
-                }
-            }
             0x80 => {
-                logical_bytes =
-                    logical_bytes.max(u64::from(read_u32(attribute.bytes, 16).unwrap_or(0)));
+                let attribute_flags = read_u16(attribute.bytes, 12).unwrap_or(0);
+                is_compressed |= attribute_flags & 0x0001 != 0;
+                is_encrypted |= attribute_flags & 0x4000 != 0;
+                is_sparse |= attribute_flags & 0x8000 != 0;
+                let is_named = attribute.name_length > 0;
+                let sizes = if attribute.non_resident {
+                    (read_u64(attribute.bytes, 16) == Some(0)).then(|| {
+                        let reserved = read_u64(attribute.bytes, 40).unwrap_or(0);
+                        let allocated = if attribute_flags & (0x0001 | 0x8000) != 0 {
+                            read_u64(attribute.bytes, 64).unwrap_or(reserved)
+                        } else {
+                            reserved
+                        };
+                        (read_u64(attribute.bytes, 48).unwrap_or(0), allocated)
+                    })
+                } else {
+                    Some((u64::from(read_u32(attribute.bytes, 16).unwrap_or(0)), 0))
+                };
+                if let Some((logical, allocated)) = sizes {
+                    if is_named {
+                        named_streams = named_streams.saturating_add(1);
+                        named_logical_bytes = named_logical_bytes.saturating_add(logical);
+                        named_allocated_bytes = named_allocated_bytes.saturating_add(allocated);
+                    } else {
+                        has_unnamed_data = true;
+                        logical_bytes = logical_bytes.max(logical);
+                        allocated_bytes = allocated_bytes.max(allocated);
+                    }
+                }
             }
             _ => {}
         }
@@ -700,16 +928,22 @@ fn parse_record(record_id: u64, record: &mut [u8], sector_size: usize) -> Parsed
         link_count: u32::from(read_u16(record, 18).unwrap_or(0)),
         logical_bytes,
         allocated_bytes,
+        has_unnamed_data,
+        named_logical_bytes,
+        named_allocated_bytes,
         fallback_logical_bytes,
         fallback_allocated_bytes,
         links,
         named_streams,
         has_attribute_list,
+        is_sparse,
+        is_compressed,
+        is_encrypted,
     })
 }
 
 struct FinishProductInput<'a> {
-    owners: Vec<OwnerRow>,
+    owners: OwnerTable,
     target: &'a str,
     max_records: usize,
     invalid_records: u64,
@@ -730,12 +964,11 @@ fn finish_product(input: FinishProductInput<'_>) -> Result<ScanProduct, String> 
         attribute_lists,
         scope,
     } = input;
-    owners
-        .par_iter_mut()
-        .for_each(|(_, owner)| normalize_links(&mut owner.links));
-    let entry_capacity: usize = owners.iter().map(|(_, owner)| owner.links.len()).sum();
+    owners.normalize_all_links();
+    let (entry_capacity, name_capacity) = owners.arena_capacity();
+    let (owner_chunks, owner_links, owner_names) = owners.into_parts();
     let mut nodes = Vec::with_capacity(entry_capacity.saturating_add(1));
-    let mut names = Vec::new();
+    let mut names = Vec::with_capacity(name_capacity.saturating_add(target.len()));
     let mut parent_records = Vec::with_capacity(entry_capacity.saturating_add(1));
     let mut record_ids = scope.map(|_| Vec::with_capacity(entry_capacity.saturating_add(1)));
     let mut physical_allocations =
@@ -743,6 +976,7 @@ fn finish_product(input: FinishProductInput<'_>) -> Result<ScanProduct, String> 
     let mut directory_nodes = vec![RAW_NODE_NO_INDEX; max_records];
     names.extend_from_slice(target.as_bytes());
     nodes.push(RawArenaNode {
+        name_offset: 0,
         name_length: target.len() as u32,
         parent: RAW_NODE_NO_INDEX,
         first_child: RAW_NODE_NO_INDEX,
@@ -768,86 +1002,113 @@ fn finish_product(input: FinishProductInput<'_>) -> Result<ScanProduct, String> 
     };
     let mut missing_base_records = 0u64;
 
-    for (record_id, owner) in owners {
-        if !owner.seen_base || owner.links.is_empty() {
-            missing_base_records = missing_base_records.saturating_add(1);
-            continue;
-        }
-        if owner.links.is_empty() {
-            continue;
-        }
-        let logical_bytes = owner.logical_bytes.max(owner.fallback_logical_bytes);
-        let allocated_bytes = if owner.is_directory {
-            0
-        } else {
-            owner.allocated_bytes.max(owner.fallback_allocated_bytes)
-        };
-        let hard_link_count = owner.link_count.max(owner.links.len() as u32);
-        statistics.hard_linked_records = statistics
-            .hard_linked_records
-            .saturating_add(u64::from(hard_link_count > 1));
-        statistics.reparse_points = statistics
-            .reparse_points
-            .saturating_add(u64::from(owner.is_reparse_point));
-        if owner.is_directory {
-            statistics.directory_count = statistics.directory_count.saturating_add(1);
-        } else {
-            statistics.file_count = statistics.file_count.saturating_add(1);
-        }
-
-        for (link_index, link) in owner.links.into_iter().enumerate() {
-            let hard_link_alias = link_index > 0 && !owner.is_directory;
-            let node_index = u32::try_from(nodes.len())
-                .map_err(|_| "the raw arena exceeded its 32-bit node limit")?;
-            let name_offset = u32::try_from(names.len())
-                .map_err(|_| "the raw arena name pool exceeded its 32-bit limit")?;
-            let name_length = u32::try_from(link.name.len())
-                .map_err(|_| "an MFT filename exceeded its supported length")?;
-            names.extend_from_slice(link.name.as_bytes());
-            let mut flags = 0u16;
+    for owner_chunk in owner_chunks {
+        for (record_id, owner) in owner_chunk {
+            if !owner.seen_base || owner.path_link_count == 0 {
+                missing_base_records = missing_base_records.saturating_add(1);
+                continue;
+            }
+            let logical_bytes = if owner.has_unnamed_data {
+                owner.logical_bytes
+            } else {
+                owner.fallback_logical_bytes
+            }
+            .saturating_add(owner.named_logical_bytes);
+            let allocated_bytes = if owner.is_directory {
+                0
+            } else {
+                (if owner.has_unnamed_data {
+                    owner.allocated_bytes
+                } else {
+                    owner.fallback_allocated_bytes
+                })
+                .saturating_add(owner.named_allocated_bytes)
+            };
+            let hard_link_count = owner.link_count.max(owner.path_link_count);
+            statistics.hard_linked_records = statistics
+                .hard_linked_records
+                .saturating_add(u64::from(hard_link_count > 1));
+            statistics.reparse_points = statistics
+                .reparse_points
+                .saturating_add(u64::from(owner.is_reparse_point));
             if owner.is_directory {
-                flags |= RAW_NODE_FLAG_DIRECTORY;
+                statistics.directory_count = statistics.directory_count.saturating_add(1);
+            } else {
+                statistics.file_count = statistics.file_count.saturating_add(1);
             }
-            if owner.is_reparse_point {
-                flags |= RAW_NODE_FLAG_REPARSE_POINT;
-            }
-            if hard_link_alias {
-                flags |= RAW_NODE_FLAG_HARD_LINK_ALIAS;
-            }
-            let node_allocated_bytes = if hard_link_alias { 0 } else { allocated_bytes };
-            statistics.logical_bytes = statistics.logical_bytes.saturating_add(logical_bytes);
-            statistics.allocated_bytes = statistics
-                .allocated_bytes
-                .saturating_add(node_allocated_bytes);
-            nodes.push(RawArenaNode {
-                name_offset,
-                name_length,
-                parent: RAW_NODE_NO_INDEX,
-                first_child: RAW_NODE_NO_INDEX,
-                next_sibling: RAW_NODE_NO_INDEX,
-                child_count: 0,
-                logical_bytes,
-                allocated_bytes: node_allocated_bytes,
-                modified_at_ms: owner.modified_at_ms.unwrap_or(-1),
-                hard_link_count,
-                flags,
-                reserved: 0,
-            });
-            parent_records.push(link.parent_record_id);
-            if let Some(record_ids) = &mut record_ids {
-                record_ids.push(record_id);
-            }
-            if let Some(allocations) = &mut physical_allocations {
-                allocations.push(allocated_bytes);
-            }
-            if owner.is_directory
-                && let Some(slot) = directory_nodes.get_mut(record_id as usize)
-                && *slot == RAW_NODE_NO_INDEX
-            {
-                *slot = node_index;
+
+            let mut link_plus_one = owner.first_link_plus_one;
+            for link_index in 0..owner.path_link_count {
+                if link_plus_one == 0 {
+                    return Err("an owner link chain ended unexpectedly".to_owned());
+                }
+                let link = owner_links[(link_plus_one - 1) as usize];
+                link_plus_one = link.next_plus_one;
+                let hard_link_alias = link_index > 0 && !owner.is_directory;
+                let node_index = u32::try_from(nodes.len())
+                    .map_err(|_| "the raw arena exceeded its 32-bit node limit")?;
+                let name_offset = u32::try_from(names.len())
+                    .map_err(|_| "the raw arena name pool exceeded its 32-bit limit")?;
+                names.extend_from_slice(owner_link_name(&link, &owner_names));
+                let mut flags = 0u16;
+                if owner.is_directory {
+                    flags |= RAW_NODE_FLAG_DIRECTORY;
+                }
+                if owner.is_reparse_point {
+                    flags |= RAW_NODE_FLAG_REPARSE_POINT;
+                }
+                if hard_link_alias {
+                    flags |= RAW_NODE_FLAG_HARD_LINK_ALIAS;
+                }
+                if owner.is_sparse {
+                    flags |= RAW_NODE_FLAG_SPARSE;
+                }
+                if owner.is_compressed {
+                    flags |= RAW_NODE_FLAG_COMPRESSED;
+                }
+                if owner.has_named_stream {
+                    flags |= RAW_NODE_FLAG_NAMED_STREAM;
+                }
+                if owner.is_encrypted {
+                    flags |= RAW_NODE_FLAG_ENCRYPTED;
+                }
+                let node_allocated_bytes = if hard_link_alias { 0 } else { allocated_bytes };
+                statistics.logical_bytes = statistics.logical_bytes.saturating_add(logical_bytes);
+                statistics.allocated_bytes = statistics
+                    .allocated_bytes
+                    .saturating_add(node_allocated_bytes);
+                nodes.push(RawArenaNode {
+                    name_offset,
+                    name_length: u32::from(link.name_length),
+                    parent: RAW_NODE_NO_INDEX,
+                    first_child: RAW_NODE_NO_INDEX,
+                    next_sibling: RAW_NODE_NO_INDEX,
+                    child_count: 0,
+                    logical_bytes,
+                    allocated_bytes: node_allocated_bytes,
+                    modified_at_ms: owner.modified_at_ms.unwrap_or(-1),
+                    hard_link_count,
+                    flags,
+                    reserved: 0,
+                });
+                parent_records.push(u64::from(link.parent_record_id));
+                if let Some(record_ids) = &mut record_ids {
+                    record_ids.push(record_id);
+                }
+                if let Some(allocations) = &mut physical_allocations {
+                    allocations.push(allocated_bytes);
+                }
+                if owner.is_directory
+                    && let Some(slot) = directory_nodes.get_mut(record_id as usize)
+                    && *slot == RAW_NODE_NO_INDEX
+                {
+                    *slot = node_index;
+                }
             }
         }
     }
+    drop(owner_links);
+    drop(owner_names);
 
     statistics.entry_count = nodes.len().saturating_sub(1) as u64;
     let mut warnings = Vec::new();
@@ -1161,6 +1422,7 @@ fn build_hierarchy(
     orphaned
 }
 
+#[cfg(test)]
 fn normalize_links(links: &mut SmallVec<[LinkCandidate; 1]>) {
     if links.len() <= 1 {
         return;
@@ -1177,6 +1439,50 @@ fn normalize_links(links: &mut SmallVec<[LinkCandidate; 1]>) {
     links.dedup_by(|left, right| {
         left.parent_record_id == right.parent_record_id && left.name == right.name
     });
+}
+
+fn normalize_owner_links(owner: &mut OwnerAccumulator, links: &mut [OwnerLink], names: &[u8]) {
+    if owner.path_link_count <= 1 {
+        return;
+    }
+    let mut indices = SmallVec::<[u32; 4]>::new();
+    let mut link_plus_one = owner.first_link_plus_one;
+    while link_plus_one != 0 && indices.len() < owner.path_link_count as usize {
+        let index = link_plus_one - 1;
+        indices.push(index);
+        link_plus_one = links[index as usize].next_plus_one;
+    }
+    let has_long_name = indices
+        .iter()
+        .any(|index| links[*index as usize].namespace != 2);
+    if has_long_name {
+        indices.retain(|index| links[*index as usize].namespace != 2);
+    }
+    indices.sort_unstable_by(|left, right| {
+        let left = &links[*left as usize];
+        let right = &links[*right as usize];
+        left.parent_record_id
+            .cmp(&right.parent_record_id)
+            .then_with(|| owner_link_name(left, names).cmp(owner_link_name(right, names)))
+    });
+    indices.dedup_by(|left, right| {
+        let left = &links[*left as usize];
+        let right = &links[*right as usize];
+        left.parent_record_id == right.parent_record_id
+            && owner_link_name(left, names) == owner_link_name(right, names)
+    });
+    for (position, index) in indices.iter().copied().enumerate() {
+        links[index as usize].next_plus_one = indices.get(position + 1).map_or(0, |next| next + 1);
+    }
+    owner.first_link_plus_one = indices.first().map_or(0, |index| index + 1);
+    owner.last_link_plus_one = indices.last().map_or(0, |index| index + 1);
+    owner.path_link_count = indices.len() as u32;
+}
+
+fn owner_link_name<'a>(link: &OwnerLink, names: &'a [u8]) -> &'a [u8] {
+    let start = link.name_offset as usize;
+    let end = start.saturating_add(link.name_length as usize);
+    names.get(start..end).unwrap_or_default()
 }
 
 fn parse_file_name(value: &[u8]) -> Option<LinkCandidate> {
@@ -1401,7 +1707,7 @@ fn raw_volume_path(target: &str) -> Result<String, String> {
         return Err("the raw helper requires a drive-letter NTFS volume".to_owned());
     }
     Ok(format!(
-        "\\\\.\\{}:",
+        r"\\.\{}:",
         char::from(bytes[0]).to_ascii_uppercase()
     ))
 }
@@ -1429,8 +1735,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn owner_storage_layout_stays_compact() {
+        assert_eq!(std::mem::size_of::<OwnerLink>(), 16);
+        assert!(std::mem::size_of::<OwnerAccumulator>() <= 112);
+    }
+
+    #[test]
     fn volume_paths_are_strictly_bounded() {
-        assert_eq!(raw_volume_path("c:\\"), Ok("\\\\.\\C:".to_owned()));
+        let path = raw_volume_path("c:\\").unwrap();
+        assert_eq!(path, r"\\.\C:");
         assert!(raw_volume_path("C:\\Windows").is_err());
     }
 
@@ -1475,19 +1788,33 @@ mod tests {
 
     #[test]
     fn resident_files_have_no_separate_cluster_allocation() {
-        let mut owner = OwnerAccumulator {
+        let owner = OwnerAccumulator {
             seen_base: true,
             logical_bytes: 512,
-            links: SmallVec::from_vec(vec![LinkCandidate {
-                parent_record_id: ROOT_RECORD,
-                name: "resident.bin".to_owned(),
-                namespace: 1,
-            }]),
+            has_unnamed_data: true,
             ..OwnerAccumulator::default()
         };
-        normalize_links(&mut owner.links);
         assert_eq!(owner.logical_bytes, 512);
         assert_eq!(owner.allocated_bytes, 0);
+    }
+
+    #[test]
+    fn progress_allocation_matches_physical_owner_accounting() {
+        let file = OwnerAccumulator {
+            allocated_bytes: 4096,
+            has_unnamed_data: true,
+            named_allocated_bytes: 1024,
+            ..OwnerAccumulator::default()
+        };
+        let directory = OwnerAccumulator {
+            is_directory: true,
+            allocated_bytes: 4096,
+            has_unnamed_data: true,
+            ..OwnerAccumulator::default()
+        };
+
+        assert_eq!(owner_allocated_bytes(&file), 5120);
+        assert_eq!(owner_allocated_bytes(&directory), 0);
     }
 
     #[test]
@@ -1515,7 +1842,11 @@ mod tests {
     fn frozen_resident_record_covers_names_streams_attributes_and_fixups() {
         let modified_ms = 12_345i64;
         let mut fixture = FrozenMftRecord::active_file(2, 0);
-        fixture.resident_attribute(0x10, &standard_information(modified_ms, 0x400), false);
+        fixture.resident_attribute(
+            0x10,
+            &standard_information(modified_ms, 0x400 | 0x200 | 0x800 | 0x4000),
+            false,
+        );
         fixture.resident_attribute(
             0x30,
             &file_name_value(ROOT_RECORD, "cache.bin", 1, 4096, 128, 0),
@@ -1542,8 +1873,13 @@ mod tests {
         assert_eq!(fragment.modified_at_ms, Some(modified_ms));
         assert_eq!(fragment.logical_bytes, 128);
         assert_eq!(fragment.allocated_bytes, 0);
+        assert_eq!(fragment.named_logical_bytes, 3);
+        assert_eq!(fragment.named_allocated_bytes, 0);
         assert_eq!(fragment.fallback_allocated_bytes, 4096);
         assert_eq!(fragment.named_streams, 1);
+        assert!(fragment.is_sparse);
+        assert!(fragment.is_compressed);
+        assert!(fragment.is_encrypted);
         assert!(fragment.has_attribute_list);
         assert_eq!(fragment.links.len(), 1);
         assert_eq!(fragment.links[0].name, "cache.bin");
@@ -1570,7 +1906,30 @@ mod tests {
         assert!(!fragment.is_base);
         assert_eq!(fragment.logical_bytes, 65_536);
         assert_eq!(fragment.allocated_bytes, 4096);
+        assert_eq!(fragment.named_logical_bytes, 2048);
+        assert_eq!(fragment.named_allocated_bytes, 1024);
         assert_eq!(fragment.named_streams, 1);
+    }
+
+    #[test]
+    fn frozen_sparse_record_uses_physical_instead_of_reserved_allocation() {
+        let mut fixture = FrozenMftRecord::active_file(1, 0);
+        fixture.resident_attribute(
+            0x30,
+            &file_name_value(ROOT_RECORD, "sparse.dat", 1, 65_536, 65_536, 0x200),
+            false,
+        );
+        fixture.sparse_data_attribute(65_536, 4096);
+        let mut record = fixture.finish();
+
+        let ParsedRecord::Valid(fragment) = parse_record(120, &mut record, 512) else {
+            panic!("frozen sparse fixture did not parse");
+        };
+
+        assert_eq!(fragment.logical_bytes, 65_536);
+        assert_eq!(fragment.allocated_bytes, 4096);
+        assert!(fragment.has_unnamed_data);
+        assert!(fragment.is_sparse);
     }
 
     #[test]
@@ -1602,7 +1961,13 @@ mod tests {
             link_count: 2,
             logical_bytes: 8192,
             allocated_bytes: 4096,
-            links: SmallVec::from_vec(vec![
+            has_unnamed_data: true,
+            ..OwnerAccumulator::default()
+        };
+        let owners = owner_table(
+            30,
+            owner,
+            SmallVec::from_vec(vec![
                 LinkCandidate {
                     parent_record_id: ROOT_RECORD,
                     name: "first.bin".to_owned(),
@@ -1614,11 +1979,10 @@ mod tests {
                     namespace: 1,
                 },
             ]),
-            ..OwnerAccumulator::default()
-        };
+        );
 
         let product = finish_product(FinishProductInput {
-            owners: vec![(30, owner)],
+            owners,
             target: "C:\\",
             max_records: 64,
             invalid_records: 0,
@@ -1636,6 +2000,65 @@ mod tests {
         assert!(product.arena.nodes[2].is_hard_link_alias());
         assert_eq!(product.arena.nodes[2].allocated_bytes, 0);
         assert_eq!(product.arena.validate(), Ok(()));
+    }
+
+    fn owner_table(
+        record_id: u64,
+        owner: OwnerAccumulator,
+        links: SmallVec<[LinkCandidate; 1]>,
+    ) -> OwnerTable {
+        let mut owners = OwnerTable::default();
+        owners.push((record_id, owner));
+        owners.add_links(0, links).unwrap();
+        owners
+    }
+
+    #[test]
+    fn product_fixture_includes_named_stream_sizes_and_attributes() {
+        let owner = OwnerAccumulator {
+            seen_base: true,
+            logical_bytes: 8192,
+            allocated_bytes: 4096,
+            has_unnamed_data: true,
+            named_logical_bytes: 2048,
+            named_allocated_bytes: 1024,
+            fallback_logical_bytes: 8192,
+            fallback_allocated_bytes: 8192,
+            is_sparse: true,
+            is_compressed: true,
+            is_encrypted: true,
+            has_named_stream: true,
+            ..OwnerAccumulator::default()
+        };
+        let owners = owner_table(
+            31,
+            owner,
+            SmallVec::from_vec(vec![LinkCandidate {
+                parent_record_id: ROOT_RECORD,
+                name: "streams.bin".to_owned(),
+                namespace: 1,
+            }]),
+        );
+
+        let product = finish_product(FinishProductInput {
+            owners,
+            target: "C:\\",
+            max_records: 64,
+            invalid_records: 0,
+            parsed_records: 1,
+            named_streams: 1,
+            attribute_lists: 0,
+            scope: None,
+        })
+        .unwrap();
+        let node = &product.arena.nodes[1];
+
+        assert_eq!(node.logical_bytes, 10_240);
+        assert_eq!(node.allocated_bytes, 5120);
+        assert!(node.is_sparse());
+        assert!(node.is_compressed());
+        assert!(node.is_encrypted());
+        assert!(node.has_named_stream());
     }
 
     #[test]
@@ -1815,6 +2238,18 @@ mod tests {
             write_u64(&mut self.bytes, start + 40, allocated_bytes);
             write_u64(&mut self.bytes, start + 48, logical_bytes);
             self.attribute_offset += 64;
+        }
+
+        fn sparse_data_attribute(&mut self, logical_bytes: u64, physical_bytes: u64) {
+            let start = self.attribute_offset;
+            write_u32(&mut self.bytes, start, 0x80);
+            write_u32(&mut self.bytes, start + 4, 72);
+            self.bytes[start + 8] = 1;
+            write_u16(&mut self.bytes, start + 12, 0x8000);
+            write_u64(&mut self.bytes, start + 40, logical_bytes);
+            write_u64(&mut self.bytes, start + 48, logical_bytes);
+            write_u64(&mut self.bytes, start + 64, physical_bytes);
+            self.attribute_offset += 72;
         }
 
         fn finish(mut self) -> Vec<u8> {

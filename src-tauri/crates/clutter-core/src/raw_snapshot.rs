@@ -6,7 +6,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread,
     time::Duration,
@@ -45,7 +45,7 @@ use windows::{
             ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS},
             Threading::{
                 GetCurrentProcess, GetExitCodeProcess, GetProcessId, OpenProcessToken,
-                WaitForSingleObject,
+                TerminateProcess, WaitForSingleObject,
             },
         },
         UI::Shell::{
@@ -66,6 +66,7 @@ use crate::{
 const ROOT_RECORD: u64 = 5;
 const MAX_RAW_STREAM_NODES: usize = 12_000_000;
 const MAX_RAW_STREAM_NAME_BYTES: usize = 512 * 1024 * 1024;
+const RAW_HELPER_EXIT_TIMEOUT: Duration = Duration::from_secs(3);
 
 pub struct RawSnapshotProduct {
     pub arena: ScanArena,
@@ -78,7 +79,7 @@ pub fn scan_with_helper(
     root_path: PathBuf,
     session_id: String,
     cancel: Arc<AtomicBool>,
-    on_progress: &mut dyn FnMut(RawScanPhase, u64, u64, u64),
+    on_progress: &mut dyn FnMut(RawScanPhase, u64, u64, u64, u64),
 ) -> Result<RawSnapshotProduct, ScanFailure> {
     let mut nonce = [0u8; 32];
     getrandom::fill(&mut nonce).map_err(|error| {
@@ -90,7 +91,9 @@ pub fn scan_with_helper(
     })?;
     let nonce_hex = encode_nonce(&nonce);
     let pipe_name = format!(r"\\.\pipe\ClutterHunter-{nonce_hex}");
+    let cancel_pipe_name = format!(r"\\.\pipe\ClutterHunter-cancel-{nonce_hex}");
     let pipe = PipeServer::create(&pipe_name)?;
+    let cancel_pipe = PipeServer::create(&cancel_pipe_name)?;
     let helper = helper_path()?;
     let parameters = [
         OsString::from("stream"),
@@ -108,8 +111,11 @@ pub fn scan_with_helper(
         ));
     }
     let mut pipe = pipe.connect(process.0, expected_pid)?;
+    let mut cancel_pipe = cancel_pipe.connect(process.0, expected_pid)?;
+    let memory_sampler = CombinedWorkingSetSampler::start(process.0);
     let stream_result = read_stream(
         &mut pipe,
+        &mut cancel_pipe,
         target,
         &nonce,
         expected_pid,
@@ -117,7 +123,11 @@ pub fn scan_with_helper(
         on_progress,
     );
     drop(pipe);
-    wait_for_helper(process.0)?;
+    drop(cancel_pipe);
+    let wait_result = wait_for_helper(process.0, RAW_HELPER_EXIT_TIMEOUT);
+    let combined_peak_working_set_bytes = memory_sampler.finish();
+    let stream = stream_result?;
+    wait_result?;
 
     let mut exit_code = 0u32;
     unsafe { GetExitCodeProcess(process.0, &mut exit_code) }.map_err(|error| {
@@ -127,7 +137,6 @@ pub fn scan_with_helper(
             true,
         )
     })?;
-    let stream = stream_result?;
     if exit_code != 0 {
         return Err(ScanFailure::new(
             "RAW_NTFS_HELPER_FAILED",
@@ -145,6 +154,7 @@ pub fn scan_with_helper(
     let arena = ScanArena::from_raw_snapshot(root_path, session_id, raw_arena)?;
     statistics.adopt_ms = u64::try_from(adopt_started.elapsed().as_millis()).unwrap_or(u64::MAX);
     statistics.host_peak_working_set_bytes = process_peak_working_set_bytes().unwrap_or(0);
+    statistics.combined_peak_working_set_bytes = combined_peak_working_set_bytes;
     if arena.entry_count() as u64 != statistics.entry_count {
         warnings.push(ScanWarning {
             code: "RAW_ENTRY_COUNT_MISMATCH".to_owned(),
@@ -176,6 +186,72 @@ fn process_peak_working_set_bytes() -> Option<u64> {
     }
     .ok()?;
     u64::try_from(counters.PeakWorkingSetSize).ok()
+}
+
+fn process_working_set_bytes(process: HANDLE) -> Option<u64> {
+    let mut counters = PROCESS_MEMORY_COUNTERS {
+        cb: std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+        ..PROCESS_MEMORY_COUNTERS::default()
+    };
+    unsafe {
+        GetProcessMemoryInfo(
+            process,
+            &mut counters,
+            std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+        )
+    }
+    .ok()?;
+    u64::try_from(counters.WorkingSetSize).ok()
+}
+
+struct CombinedWorkingSetSampler {
+    stop: Arc<AtomicBool>,
+    peak: Arc<AtomicU64>,
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+impl CombinedWorkingSetSampler {
+    fn start(helper: HANDLE) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let peak = Arc::new(AtomicU64::new(0));
+        let worker_stop = Arc::clone(&stop);
+        let worker_peak = Arc::clone(&peak);
+        let helper = helper.0 as usize;
+        let worker = thread::spawn(move || {
+            let helper = HANDLE(helper as *mut std::ffi::c_void);
+            while !worker_stop.load(Ordering::Acquire) {
+                if let (Some(host), Some(helper)) = (
+                    process_working_set_bytes(unsafe { GetCurrentProcess() }),
+                    process_working_set_bytes(helper),
+                ) {
+                    worker_peak.fetch_max(host.saturating_add(helper), Ordering::AcqRel);
+                }
+                thread::sleep(Duration::from_millis(25));
+            }
+        });
+        Self {
+            stop,
+            peak,
+            worker: Some(worker),
+        }
+    }
+
+    fn finish(mut self) -> u64 {
+        self.stop.store(true, Ordering::Release);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+        self.peak.load(Ordering::Acquire)
+    }
+}
+
+impl Drop for CombinedWorkingSetSampler {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -357,6 +433,10 @@ fn discovered_entry(entry: &RawScanEntry, temporary_id: u32, parent: u32) -> Dis
         is_directory: entry.is_directory,
         is_reparse_point: entry.is_reparse_point,
         inaccessible: false,
+        is_sparse: false,
+        is_compressed: false,
+        is_encrypted: false,
+        has_named_stream: false,
         logical_bytes: entry.logical_bytes,
         allocated_bytes: entry.allocated_bytes,
         modified_at_ms: entry.modified_at_ms,
@@ -372,12 +452,13 @@ struct RawStreamProduct {
 }
 
 fn read_stream(
-    reader: &mut (impl Read + Write),
+    reader: &mut impl Read,
+    cancel_writer: &mut impl Write,
     target: &str,
     nonce: &[u8; 32],
     expected_pid: u32,
     cancel: &AtomicBool,
-    on_progress: &mut dyn FnMut(RawScanPhase, u64, u64, u64),
+    on_progress: &mut dyn FnMut(RawScanPhase, u64, u64, u64, u64),
 ) -> Result<RawStreamProduct, ScanFailure> {
     let hello = match read_frame(reader)? {
         HelperMessage::Hello(hello) => hello,
@@ -406,7 +487,7 @@ fn read_stream(
     let mut cancellation_sent = false;
     loop {
         if cancel.load(Ordering::Acquire) && !cancellation_sent {
-            write_frame(reader, &HelperMessage::Cancel)?;
+            write_frame(cancel_writer, &HelperMessage::Cancel)?;
             cancellation_sent = true;
         }
         match read_frame(reader)? {
@@ -414,8 +495,15 @@ fn read_stream(
                 phase,
                 records_seen,
                 mft_bytes_read,
+                allocated_bytes,
                 elapsed_ms,
-            } => on_progress(phase, records_seen, mft_bytes_read, elapsed_ms),
+            } => on_progress(
+                phase,
+                records_seen,
+                mft_bytes_read,
+                allocated_bytes,
+                elapsed_ms,
+            ),
             HelperMessage::Warning { code, detail } => {
                 if warnings.len() >= 1024 || code.len() > 128 || detail.len() > 64 * 1024 {
                     return Err(invalid_stream("A scanner stream warning was invalid"));
@@ -874,7 +962,8 @@ fn elevation_failure_code(code: HRESULT) -> &'static str {
     }
 }
 
-fn wait_for_helper(process: HANDLE) -> Result<(), ScanFailure> {
+fn wait_for_helper(process: HANDLE, timeout: Duration) -> Result<(), ScanFailure> {
+    let started = std::time::Instant::now();
     loop {
         let status = unsafe { WaitForSingleObject(process, 100) };
         if status == WAIT_OBJECT_0 {
@@ -891,6 +980,14 @@ fn wait_for_helper(process: HANDLE) -> Result<(), ScanFailure> {
             return Err(ScanFailure::new(
                 "RAW_NTFS_HELPER_FAILED",
                 "The elevated scanner helper returned an unexpected wait status",
+                true,
+            ));
+        }
+        if started.elapsed() >= timeout {
+            let _ = unsafe { TerminateProcess(process, 70) };
+            return Err(ScanFailure::new(
+                "RAW_NTFS_HELPER_STALLED",
+                "The elevated scanner helper did not exit after its stream closed",
                 true,
             ));
         }
@@ -965,7 +1062,7 @@ mod tests {
     use crate::{
         backend::{ScanBackendEngine, TraversalBackend},
         scan::{
-            ItemQuery, ItemSort, ScanBackend, ScanRequest, ScanTarget, ScanTargetKind,
+            ItemQuery, ItemRow, ItemSort, ScanBackend, ScanRequest, ScanTarget, ScanTargetKind,
             SortDirection,
         },
     };
@@ -1035,6 +1132,7 @@ mod tests {
                 phase: RawScanPhase::Enumerating,
                 records_seen: 1,
                 mft_bytes_read: 1024,
+                allocated_bytes: 4096,
                 elapsed_ms: 12,
             },
             HelperMessage::ArenaHeader {
@@ -1058,18 +1156,19 @@ mod tests {
         let cancel = AtomicBool::new(false);
         let product = read_stream(
             &mut reader,
+            &mut Vec::new(),
             "C:\\",
             &nonce,
             42,
             &cancel,
-            &mut |phase, records, _, _| {
-                progress.push((phase, records));
+            &mut |phase, records, _, allocated, _| {
+                progress.push((phase, records, allocated));
             },
         )?;
 
         assert_eq!(product.arena.nodes.len(), 1);
         assert_eq!(product.arena.names, b"C:\\");
-        assert_eq!(progress, vec![(RawScanPhase::Enumerating, 1)]);
+        assert_eq!(progress, vec![(RawScanPhase::Enumerating, 1, 4096)]);
         Ok(())
     }
 
@@ -1095,11 +1194,12 @@ mod tests {
         let cancel = AtomicBool::new(false);
         let error = read_stream(
             &mut std::io::Cursor::new(encode_frames(&messages)),
+            &mut Vec::new(),
             "C:\\",
             &nonce,
             7,
             &cancel,
-            &mut |_, _, _, _| {},
+            &mut |_, _, _, _, _| {},
         )
         .err()
         .expect("the invalid stream must fail");
@@ -1125,17 +1225,51 @@ mod tests {
         ];
         let error = read_stream(
             &mut std::io::Cursor::new(encode_frames(&messages)),
+            &mut Vec::new(),
             "C:\\",
             &nonce,
             8,
             &AtomicBool::new(false),
-            &mut |_, _, _, _| {},
+            &mut |_, _, _, _, _| {},
         )
         .err()
         .expect("a helper error frame must fail the scan");
 
         assert_eq!(error.code, "RAW_NTFS_SCAN_FAILED");
         assert!(error.recoverable);
+    }
+
+    #[test]
+    fn cancellation_is_framed_on_the_control_stream() {
+        let nonce = [5; 32];
+        let messages = vec![
+            HelperMessage::Hello(HelperHello {
+                protocol_version: PROTOCOL_VERSION,
+                nonce,
+                helper_pid: 9,
+                target: "C:\\".to_owned(),
+            }),
+            HelperMessage::Error {
+                code: "SCAN_CANCELLED".to_owned(),
+                recoverable: true,
+                detail: "fixture cancellation".to_owned(),
+            },
+        ];
+        let mut control = Vec::new();
+        let _ = read_stream(
+            &mut std::io::Cursor::new(encode_frames(&messages)),
+            &mut control,
+            "C:\\",
+            &nonce,
+            9,
+            &AtomicBool::new(true),
+            &mut |_, _, _, _, _| {},
+        );
+
+        assert!(matches!(
+            read_frame(&mut std::io::Cursor::new(control)).unwrap(),
+            HelperMessage::Cancel
+        ));
     }
 
     #[test]
@@ -1161,24 +1295,60 @@ mod tests {
     }
 
     #[test]
+    fn data_and_control_pipe_instances_operate_independently() -> Result<(), ScanFailure> {
+        let nonce = encode_nonce(&[7; 32]);
+        let data_name = format!(r"\\.\pipe\ClutterHunter-data-test-{nonce}");
+        let control_name = format!(r"\\.\pipe\ClutterHunter-control-test-{nonce}");
+        let data_server = PipeServer::create(&data_name)?;
+        let control_server = PipeServer::create(&control_name)?;
+        let client = thread::spawn(move || {
+            let mut data = std::fs::OpenOptions::new()
+                .write(true)
+                .open(data_name)
+                .unwrap();
+            let mut control = std::fs::OpenOptions::new()
+                .read(true)
+                .open(control_name)
+                .unwrap();
+            write_frame(&mut data, &HelperMessage::Cancel).unwrap();
+            read_frame(&mut control).unwrap()
+        });
+        let process = unsafe { GetCurrentProcess() };
+        let mut data_server = data_server.connect(process, std::process::id())?;
+        let mut control_server = control_server.connect(process, std::process::id())?;
+
+        assert!(matches!(
+            read_frame(&mut data_server)?,
+            HelperMessage::Cancel
+        ));
+        write_frame(&mut control_server, &HelperMessage::Cancel)?;
+        assert!(matches!(client.join().unwrap(), HelperMessage::Cancel));
+        Ok(())
+    }
+
+    #[test]
     #[ignore = "requires Windows elevation and a real NTFS volume"]
     fn elevated_named_pipe_scan_smoke_test() -> Result<(), ScanFailure> {
         let target =
             std::env::var("CLUTTERHUNTER_TEST_VOLUME").unwrap_or_else(|_| "C:\\".to_owned());
+        let mut last_phase = None;
         let output = scan_with_helper(
             &target,
             PathBuf::from(&target),
             "manual-raw-smoke".to_owned(),
             Arc::new(AtomicBool::new(false)),
-            &mut |phase, records, bytes, elapsed| {
-                println!(
-                    "progress phase={phase:?} records={records} bytes={bytes} elapsed_ms={elapsed}"
-                );
+            &mut |phase, records, bytes, allocated, elapsed| {
+                if last_phase != Some(phase) {
+                    println!(
+                        "progress phase={phase:?} records={records} mft_bytes={bytes} allocated_bytes={allocated} elapsed_ms={elapsed}"
+                    );
+                    last_phase = Some(phase);
+                }
             },
         )?;
 
         println!(
-            "entries={} scan_ms={} stream_ms={} adopt_ms={} allocated_bytes={} arena_bytes={} helper_peak={} host_peak={}",
+            "entries={} scan_ms={} stream_ms={} adopt_ms={} allocated_bytes={} arena_bytes={} helper_peak={} host_peak={} combined_peak={}",
             output.arena.entry_count(),
             output.statistics.elapsed_ms,
             output.statistics.stream_ms,
@@ -1190,6 +1360,7 @@ mod tests {
                 .saturating_add(output.statistics.arena_name_bytes),
             output.statistics.helper_peak_working_set_bytes,
             output.statistics.host_peak_working_set_bytes,
+            output.statistics.combined_peak_working_set_bytes,
         );
         assert!(output.arena.entry_count() > 0);
         Ok(())
@@ -1206,16 +1377,60 @@ mod tests {
         std::fs::write(first.join("payload.bin"), vec![0xA5; 32 * 1024]).map_err(fixture_error)?;
         std::fs::hard_link(first.join("payload.bin"), second.join("alias.bin"))
             .map_err(fixture_error)?;
+        std::fs::write(fixture.path.join("resident.bin"), [1, 2, 3]).map_err(fixture_error)?;
+        std::fs::write(fixture.path.join("nonresident.bin"), vec![0x5A; 256 * 1024])
+            .map_err(fixture_error)?;
         std::fs::write(fixture.path.join("zero.txt"), []).map_err(fixture_error)?;
+        let sparse_path = fixture.path.join("sparse.bin");
+        create_sparse_file(&sparse_path)?;
+        let compressed_path = fixture.path.join("compressed.bin");
+        let compressed = create_compressed_file(&compressed_path)?;
+        let stream_path = fixture.path.join("streams.bin");
+        std::fs::write(&stream_path, vec![0x11; 4096]).map_err(fixture_error)?;
+        std::fs::write(
+            format!("{}:fixture", stream_path.display()),
+            vec![0x22; 8192],
+        )
+        .map_err(fixture_error)?;
+        let reparse_created =
+            std::os::windows::fs::symlink_dir(&first, fixture.path.join("alpha-link")).is_ok();
+        let changing_path = fixture.path.join("changing.bin");
+        std::fs::write(&changing_path, vec![0; 4096]).map_err(fixture_error)?;
+        let stop_writer = Arc::new(AtomicBool::new(false));
+        let writer_stop = Arc::clone(&stop_writer);
+        let writer = thread::spawn(move || {
+            use std::io::{Seek as _, SeekFrom, Write as _};
+            for value in 0..6_000u32 {
+                if writer_stop.load(Ordering::Acquire) {
+                    break;
+                }
+                if let Ok(mut file) = std::fs::OpenOptions::new().write(true).open(&changing_path) {
+                    let _ = file.seek(SeekFrom::Start(0));
+                    let _ = file.write_all(&value.to_le_bytes());
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+        });
 
         let target_path = fixture.path.to_string_lossy().into_owned();
-        let raw = scan_with_helper(
+        let mut last_phase = None;
+        let raw_result = scan_with_helper(
             &target_path,
             fixture.path.clone(),
             "differential-raw".to_owned(),
             Arc::new(AtomicBool::new(false)),
-            &mut |_, _, _, _| {},
-        )?;
+            &mut |phase, records, bytes, allocated, elapsed| {
+                if last_phase != Some(phase) {
+                    println!(
+                        "raw_progress phase={phase:?} records={records} mft_bytes={bytes} allocated_bytes={allocated} elapsed_ms={elapsed}"
+                    );
+                    last_phase = Some(phase);
+                }
+            },
+        );
+        stop_writer.store(true, Ordering::Release);
+        let _ = writer.join();
+        let raw = raw_result?;
         let request = ScanRequest {
             target: ScanTarget {
                 id: "differential-fixture".to_owned(),
@@ -1236,13 +1451,110 @@ mod tests {
             &mut |_| {},
         )?;
 
-        assert_eq!(raw.arena.entry_count(), traversal.arena.entry_count());
-        assert_eq!(raw.arena.logical_bytes(), traversal.arena.logical_bytes());
-        assert_eq!(
-            raw.arena.allocated_bytes(),
-            traversal.arena.allocated_bytes()
-        );
         assert_eq!(root_names(&raw.arena)?, root_names(&traversal.arena)?);
+        let raw_rows = rows_by_name(&raw.arena);
+        let traversal_rows = rows_by_name(&traversal.arena);
+        for name in [
+            "payload.bin",
+            "alias.bin",
+            "resident.bin",
+            "nonresident.bin",
+            "zero.txt",
+            "sparse.bin",
+            "compressed.bin",
+            "streams.bin",
+            "changing.bin",
+        ] {
+            assert!(raw_rows.contains_key(name), "raw scan omitted {name}");
+            assert!(
+                traversal_rows.contains_key(name),
+                "traversal scan omitted {name}"
+            );
+        }
+        assert_eq!(
+            raw_rows["payload.bin"].allocated_bytes == "0",
+            raw_rows["alias.bin"].allocated_bytes != "0"
+        );
+        assert_eq!(
+            traversal_rows["payload.bin"].allocated_bytes == "0",
+            traversal_rows["alias.bin"].allocated_bytes != "0"
+        );
+        assert!(
+            raw_rows["sparse.bin"]
+                .attributes
+                .contains(&"sparse".to_owned())
+        );
+        assert!(
+            traversal_rows["sparse.bin"]
+                .attributes
+                .contains(&"sparse".to_owned())
+        );
+        assert!(
+            raw_rows["sparse.bin"]
+                .allocated_bytes
+                .parse::<u64>()
+                .unwrap()
+                < raw_rows["sparse.bin"].logical_bytes.parse::<u64>().unwrap()
+        );
+        if compressed {
+            assert!(
+                raw_rows["compressed.bin"]
+                    .attributes
+                    .contains(&"compressed".to_owned())
+            );
+            assert!(
+                traversal_rows["compressed.bin"]
+                    .attributes
+                    .contains(&"compressed".to_owned())
+            );
+        }
+        assert!(
+            raw_rows["streams.bin"]
+                .attributes
+                .contains(&"alternate_data_stream".to_owned())
+        );
+        assert!(
+            raw_rows["streams.bin"]
+                .logical_bytes
+                .parse::<u64>()
+                .unwrap()
+                > traversal_rows["streams.bin"]
+                    .logical_bytes
+                    .parse::<u64>()
+                    .unwrap()
+        );
+        if reparse_created {
+            assert_eq!(
+                raw_rows["alpha-link"].kind,
+                crate::scan::ItemKind::ReparsePoint
+            );
+            assert_eq!(
+                traversal_rows["alpha-link"].kind,
+                crate::scan::ItemKind::ReparsePoint
+            );
+        }
+        let journal_changed = matches!(
+            (
+                raw.statistics.journal_id_start,
+                raw.statistics.journal_next_usn_start,
+                raw.statistics.journal_id_end,
+                raw.statistics.journal_next_usn_end,
+            ),
+            (Some(start_id), Some(start_usn), Some(end_id), Some(end_usn))
+                if start_id != end_id || start_usn != end_usn
+        );
+        println!(
+            "raw_entries={} traversal_entries={} raw_allocated={} traversal_allocated={} named_streams={} compressed_fixture={} reparse_fixture={} journal_changed={}",
+            raw.arena.entry_count(),
+            traversal.arena.entry_count(),
+            raw.arena.allocated_bytes(),
+            traversal.arena.allocated_bytes(),
+            raw.statistics.named_data_streams,
+            compressed,
+            reparse_created,
+            journal_changed,
+        );
+        assert!(raw.statistics.named_data_streams > 0);
         Ok(())
     }
 
@@ -1262,7 +1574,7 @@ mod tests {
             PathBuf::from(&target),
             "manual-raw-cancel".to_owned(),
             cancel,
-            &mut |_, _, _, _| {},
+            &mut |_, _, _, _, _| {},
         );
         let _ = worker.join();
         let error = match result {
@@ -1317,6 +1629,72 @@ mod tests {
             ..ItemQuery::default()
         })?;
         Ok(page.items.into_iter().map(|item| item.name).collect())
+    }
+
+    fn rows_by_name(arena: &ScanArena) -> HashMap<String, ItemRow> {
+        (1..arena.node_count() as u32)
+            .map(|index| {
+                let row = arena.item_row(index);
+                (row.name.clone(), row)
+            })
+            .collect()
+    }
+
+    fn create_sparse_file(path: &Path) -> Result<(), ScanFailure> {
+        use std::{
+            io::{Seek as _, SeekFrom, Write as _},
+            os::windows::io::AsRawHandle as _,
+        };
+        use windows::Win32::{
+            Foundation::HANDLE,
+            System::{IO::DeviceIoControl, Ioctl::FSCTL_SET_SPARSE},
+        };
+
+        let mut file = std::fs::File::create(path).map_err(fixture_error)?;
+        unsafe {
+            DeviceIoControl(
+                HANDLE(file.as_raw_handle()),
+                FSCTL_SET_SPARSE,
+                None,
+                0,
+                None,
+                0,
+                None,
+                None,
+            )
+        }
+        .map_err(|error| fixture_error(std::io::Error::other(error)))?;
+        file.set_len(64 * 1024 * 1024).map_err(fixture_error)?;
+        file.seek(SeekFrom::Start(64 * 1024 * 1024 - 4096))
+            .map_err(fixture_error)?;
+        file.write_all(&[0x33; 4096]).map_err(fixture_error)
+    }
+
+    fn create_compressed_file(path: &Path) -> Result<bool, ScanFailure> {
+        use std::{io::Write as _, os::windows::io::AsRawHandle as _};
+        use windows::Win32::{
+            Foundation::HANDLE,
+            System::{IO::DeviceIoControl, Ioctl::FSCTL_SET_COMPRESSION},
+        };
+
+        let mut file = std::fs::File::create(path).map_err(fixture_error)?;
+        let mut format = 1u16;
+        let compressed = unsafe {
+            DeviceIoControl(
+                HANDLE(file.as_raw_handle()),
+                FSCTL_SET_COMPRESSION,
+                Some(std::ptr::addr_of_mut!(format).cast()),
+                std::mem::size_of::<u16>() as u32,
+                None,
+                0,
+                None,
+                None,
+            )
+        }
+        .is_ok();
+        file.write_all(&vec![0x44; 2 * 1024 * 1024])
+            .map_err(fixture_error)?;
+        Ok(compressed)
     }
 
     fn stream_root() -> RawArenaNode {

@@ -46,11 +46,14 @@ pub fn scan_targets() -> Vec<ScanTarget> {
             )
         };
 
-        let filesystem = volume_info
-            .as_ref()
-            .ok()
-            .map(|_| utf16_buffer_to_string(&filesystem_buffer))
-            .filter(|value| !value.is_empty());
+        // GetLogicalDrives also reports empty card-reader slots. Only expose a
+        // target after Windows confirms that a mounted volume is ready.
+        if volume_info.is_err() {
+            continue;
+        }
+
+        let filesystem =
+            Some(utf16_buffer_to_string(&filesystem_buffer)).filter(|value| !value.is_empty());
 
         let mut volume_name_buffer = [0u16; 50];
         let volume_id = unsafe {
@@ -70,11 +73,11 @@ pub fn scan_targets() -> Vec<ScanTarget> {
                 None,
             )
         };
-        let (total_bytes, available_bytes) = if disk_space.is_ok() {
-            (Some(total.to_string()), Some(available.to_string()))
-        } else {
-            (None, None)
-        };
+        if disk_space.is_err() {
+            continue;
+        }
+        let total_bytes = Some(total.to_string());
+        let available_bytes = Some(available.to_string());
 
         let stable_id = volume_id
             .as_deref()
@@ -172,5 +175,17 @@ mod tests {
                 .iter()
                 .all(|target| target.display_path.ends_with("\\"))
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_mounted_targets_have_volume_metadata() {
+        let targets = scan_targets();
+
+        for target in targets.iter().filter(|target| target.id != "system-volume") {
+            assert!(target.filesystem.is_some(), "{}", target.display_path);
+            assert!(target.total_bytes.is_some(), "{}", target.display_path);
+            assert!(target.available_bytes.is_some(), "{}", target.display_path);
+        }
     }
 }

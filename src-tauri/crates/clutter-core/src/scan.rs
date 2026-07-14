@@ -9,7 +9,7 @@ pub enum ScanTargetKind {
     Folder,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
 #[ts(export, export_to = "../../../../src/bindings/")]
 pub enum ScanBackend {
@@ -49,6 +49,13 @@ pub struct ScanTarget {
     pub total_bytes: Option<String>,
     pub available_bytes: Option<String>,
     pub fast_scan_available: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../../src/bindings/")]
+pub struct HardwareProfile {
+    pub total_memory_bytes: String,
+    pub available_memory_bytes: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -115,6 +122,8 @@ pub struct ScanSummary {
     pub allocated_bytes: String,
     pub volume_used_bytes: Option<String>,
     pub unaccounted_bytes: Option<String>,
+    pub started_at_ms: String,
+    pub completed_at_ms: String,
     pub elapsed_ms: String,
     pub warnings: Vec<ScanWarning>,
 }
@@ -128,7 +137,7 @@ pub enum ItemKind {
     ReparsePoint,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
 #[ts(export, export_to = "../../../../src/bindings/")]
 pub enum ItemSort {
@@ -177,6 +186,9 @@ pub struct ItemQuery {
     #[serde(default)]
     #[ts(optional)]
     pub modified_before_ms: Option<String>,
+    #[serde(default)]
+    #[ts(optional)]
+    pub query_id: Option<String>,
     pub sort: ItemSort,
     pub direction: SortDirection,
     pub cursor: Option<String>,
@@ -195,6 +207,7 @@ impl Default for ItemQuery {
             owner_ids: None,
             min_bytes: None,
             modified_before_ms: None,
+            query_id: None,
             sort: ItemSort::Name,
             direction: SortDirection::Asc,
             cursor: None,
@@ -296,6 +309,32 @@ impl Default for PolicyEvidence {
 pub struct ItemDetails {
     pub item: ItemRow,
     pub evidence: PolicyEvidence,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../../src/bindings/")]
+pub struct LogExcerptRequest {
+    pub item_ids: Vec<String>,
+    pub requested_bytes_per_file: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../../src/bindings/")]
+pub struct LogExcerpt {
+    pub item_id: String,
+    pub display_path: String,
+    pub encoding: String,
+    pub content: String,
+    pub original_bytes: String,
+    pub returned_bytes: String,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../../src/bindings/")]
+pub struct LogExcerptBatch {
+    pub excerpts: Vec<LogExcerpt>,
+    pub total_returned_bytes: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -407,6 +446,10 @@ pub struct CleanupPlan {
     pub selected_review_bytes: String,
     pub review_potential_bytes: String,
     pub target_shortfall_bytes: String,
+    pub truncated: bool,
+    pub omitted_item_count: String,
+    pub omitted_candidate_bytes: String,
+    pub omitted_review_bytes: String,
     pub items: Vec<PlanItem>,
 }
 

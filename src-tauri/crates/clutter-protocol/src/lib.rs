@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u16 = 6;
+pub const PROTOCOL_VERSION: u16 = 10;
 pub const RAW_FRAME_LIMIT: usize = 4 * 1024 * 1024;
 pub const RAW_NODE_BATCH_SIZE: usize = 32 * 1024;
 pub const RAW_NAME_BATCH_SIZE: usize = 2 * 1024 * 1024;
@@ -9,6 +9,18 @@ pub const RAW_NODE_FLAG_DIRECTORY: u16 = 1 << 0;
 pub const RAW_NODE_FLAG_REPARSE_POINT: u16 = 1 << 1;
 pub const RAW_NODE_FLAG_INACCESSIBLE: u16 = 1 << 2;
 pub const RAW_NODE_FLAG_HARD_LINK_ALIAS: u16 = 1 << 3;
+pub const RAW_NODE_FLAG_SPARSE: u16 = 1 << 4;
+pub const RAW_NODE_FLAG_COMPRESSED: u16 = 1 << 5;
+pub const RAW_NODE_FLAG_NAMED_STREAM: u16 = 1 << 6;
+pub const RAW_NODE_FLAG_ENCRYPTED: u16 = 1 << 7;
+pub const RAW_NODE_KNOWN_FLAGS: u16 = RAW_NODE_FLAG_DIRECTORY
+    | RAW_NODE_FLAG_REPARSE_POINT
+    | RAW_NODE_FLAG_INACCESSIBLE
+    | RAW_NODE_FLAG_HARD_LINK_ALIAS
+    | RAW_NODE_FLAG_SPARSE
+    | RAW_NODE_FLAG_COMPRESSED
+    | RAW_NODE_FLAG_NAMED_STREAM
+    | RAW_NODE_FLAG_ENCRYPTED;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HelperHello {
@@ -45,6 +57,7 @@ pub struct RawScanStatistics {
     pub adopt_ms: u64,
     pub helper_peak_working_set_bytes: u64,
     pub host_peak_working_set_bytes: u64,
+    pub combined_peak_working_set_bytes: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -72,6 +85,8 @@ pub struct RawScanWarning {
 #[serde(rename_all = "snake_case")]
 pub enum RawScanPhase {
     Preparing,
+    CheckingJournal,
+    ReadingMetadata,
     Enumerating,
     Indexing,
     Finalizing,
@@ -110,6 +125,22 @@ impl RawArenaNode {
     pub fn is_hard_link_alias(&self) -> bool {
         self.flags & RAW_NODE_FLAG_HARD_LINK_ALIAS != 0
     }
+
+    pub fn is_sparse(&self) -> bool {
+        self.flags & RAW_NODE_FLAG_SPARSE != 0
+    }
+
+    pub fn is_compressed(&self) -> bool {
+        self.flags & RAW_NODE_FLAG_COMPRESSED != 0
+    }
+
+    pub fn has_named_stream(&self) -> bool {
+        self.flags & RAW_NODE_FLAG_NAMED_STREAM != 0
+    }
+
+    pub fn is_encrypted(&self) -> bool {
+        self.flags & RAW_NODE_FLAG_ENCRYPTED != 0
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -132,6 +163,9 @@ impl RawArenaSnapshot {
         }
 
         for (index, node) in self.nodes.iter().enumerate() {
+            if node.flags & !RAW_NODE_KNOWN_FLAGS != 0 || node.reserved != 0 {
+                return Err("A raw arena node contained unsupported flags");
+            }
             let name_start = node.name_offset as usize;
             let name_end = name_start
                 .checked_add(node.name_length as usize)
@@ -236,6 +270,7 @@ pub enum HelperMessage {
         phase: RawScanPhase,
         records_seen: u64,
         mft_bytes_read: u64,
+        allocated_bytes: u64,
         elapsed_ms: u64,
     },
     Warning {
@@ -296,7 +331,7 @@ mod tests {
 
     #[test]
     fn protocol_version_tracks_the_binary_wire_format() {
-        assert_eq!(PROTOCOL_VERSION, 6);
+        assert_eq!(PROTOCOL_VERSION, 10);
     }
 
     #[test]
@@ -375,6 +410,17 @@ mod tests {
         assert_eq!(
             arena.validate(),
             Err("The raw arena contained a parent cycle")
+        );
+    }
+
+    #[test]
+    fn compact_raw_arena_rejects_unknown_flags() {
+        let mut arena = valid_raw_arena();
+        arena.nodes[1].flags = 1 << 15;
+
+        assert_eq!(
+            arena.validate(),
+            Err("A raw arena node contained unsupported flags")
         );
     }
 }

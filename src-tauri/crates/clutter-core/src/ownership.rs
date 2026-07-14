@@ -17,10 +17,23 @@ pub fn discover_owners() -> Vec<OwnerRecord> {
             .canonical_root
             .len()
             .cmp(&left.canonical_root.len())
+            .then_with(|| {
+                owner_source_rank(left.summary.source).cmp(&owner_source_rank(right.summary.source))
+            })
             .then_with(|| left.summary.id.cmp(&right.summary.id))
     });
-    owners.dedup_by(|left, right| left.canonical_root == right.canonical_root);
+    let mut roots = std::collections::HashSet::new();
+    owners.retain(|owner| roots.insert(owner.canonical_root.clone()));
     owners
+}
+
+fn owner_source_rank(source: OwnerSource) -> u8 {
+    match source {
+        OwnerSource::Registry => 0,
+        OwnerSource::Appx => 1,
+        OwnerSource::KnownRoot => 2,
+        OwnerSource::BundledMapping => 3,
+    }
 }
 
 pub fn match_owner<'a>(path: &str, owners: &'a [OwnerRecord]) -> Option<&'a OwnerRecord> {
@@ -118,6 +131,7 @@ mod windows_registry {
     use std::{ffi::OsString, os::windows::ffi::OsStringExt as _};
 
     use windows::{
+        Management::Deployment::PackageManager,
         Win32::{
             Foundation::{ERROR_MORE_DATA, ERROR_NO_MORE_ITEMS, ERROR_SUCCESS},
             System::Registry::{
@@ -126,7 +140,7 @@ mod windows_registry {
                 RegEnumKeyExW, RegGetValueW, RegOpenKeyExW,
             },
         },
-        core::{PCWSTR, PWSTR},
+        core::{HSTRING, PCWSTR, PWSTR},
     };
 
     use super::*;
@@ -142,11 +156,60 @@ mod windows_registry {
                 enumerate_view(root, scope, view, KEY_READ | flag, &mut owners);
             }
         }
-        enumerate_appx(&mut owners);
+        let appx = enumerate_appx_winrt();
+        if appx.is_empty() {
+            enumerate_appx_registry(&mut owners);
+        } else {
+            owners.extend(appx);
+        }
         owners
     }
 
-    fn enumerate_appx(owners: &mut Vec<OwnerRecord>) {
+    fn enumerate_appx_winrt() -> Vec<OwnerRecord> {
+        let Some(packages) = PackageManager::new()
+            .and_then(|manager| manager.FindPackagesByUserSecurityId(&HSTRING::new()))
+            .ok()
+        else {
+            return Vec::new();
+        };
+        let mut owners = Vec::new();
+        for package in packages {
+            let Some(path) = package
+                .InstalledPath()
+                .ok()
+                .map(|path| path.to_string())
+                .filter(|path| Path::new(path).is_absolute())
+            else {
+                continue;
+            };
+            let canonical_root = canonical_path(path);
+            let package_id = package.Id().ok();
+            let fallback_name = package_id
+                .as_ref()
+                .and_then(|id| id.Name().ok())
+                .map(|name| name.to_string())
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| "Windows app package".to_owned());
+            let name = package
+                .DisplayName()
+                .ok()
+                .map(|name| name.to_string())
+                .filter(|name| !name.is_empty() && !name.starts_with("ms-resource:"))
+                .unwrap_or(fallback_name);
+            owners.push(OwnerRecord {
+                summary: OwnerSummary {
+                    id: format!("appx-{:016x}", stable_hash(&canonical_root)),
+                    name,
+                    source: OwnerSource::Appx,
+                    match_kind: OwnerMatchKind::Prefix,
+                },
+                canonical_root,
+            });
+        }
+        owners
+    }
+
+    fn enumerate_appx_registry(owners: &mut Vec<OwnerRecord>) {
         let Some(program_files) = std::env::var_os("ProgramW6432")
             .or_else(|| std::env::var_os("ProgramFiles"))
             .map(PathBuf::from)
@@ -353,5 +416,46 @@ mod tests {
             Some("specific")
         );
         assert!(match_owner(r"C:\Application", &owners).is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "reads installed Win32 and AppX ownership from the current Windows machine"]
+    fn windows_owner_discovery_smoke_test() {
+        let owners = discover_owners();
+        let registry = owners
+            .iter()
+            .filter(|owner| owner.summary.source == OwnerSource::Registry)
+            .count();
+        let appx = owners
+            .iter()
+            .filter(|owner| owner.summary.source == OwnerSource::Appx)
+            .count();
+        println!(
+            "owners={} registry={} appx={} known_or_bundled={}",
+            owners.len(),
+            registry,
+            appx,
+            owners.len().saturating_sub(registry + appx)
+        );
+
+        assert!(owners.iter().any(|owner| owner.summary.id == "windows"));
+        assert!(owners.iter().all(|owner| {
+            Path::new(&owner.canonical_root).is_absolute()
+                && !owner.canonical_root.ends_with('\\')
+                && !owner.summary.name.trim().is_empty()
+        }));
+        let mut roots = std::collections::HashSet::new();
+        assert!(
+            owners
+                .iter()
+                .all(|owner| roots.insert(&owner.canonical_root))
+        );
+        assert!(
+            owners
+                .iter()
+                .filter(|owner| owner.summary.source == OwnerSource::Appx)
+                .all(|owner| !owner.summary.name.starts_with("ms-resource:"))
+        );
     }
 }

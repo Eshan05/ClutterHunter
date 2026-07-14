@@ -1,8 +1,10 @@
 use std::path::PathBuf;
 
 use clutter_protocol::{
-    RAW_NODE_FLAG_DIRECTORY, RAW_NODE_FLAG_HARD_LINK_ALIAS, RAW_NODE_FLAG_INACCESSIBLE,
-    RAW_NODE_FLAG_REPARSE_POINT, RAW_NODE_NO_INDEX, RawArenaNode, RawArenaSnapshot,
+    RAW_NODE_FLAG_COMPRESSED, RAW_NODE_FLAG_DIRECTORY, RAW_NODE_FLAG_ENCRYPTED,
+    RAW_NODE_FLAG_HARD_LINK_ALIAS, RAW_NODE_FLAG_INACCESSIBLE, RAW_NODE_FLAG_NAMED_STREAM,
+    RAW_NODE_FLAG_REPARSE_POINT, RAW_NODE_FLAG_SPARSE, RAW_NODE_NO_INDEX, RawArenaNode,
+    RawArenaSnapshot,
 };
 
 use crate::scan::{ItemKind, ItemPage, ItemQuery, ItemRow, ItemSort, ScanFailure, SortDirection};
@@ -18,6 +20,10 @@ pub struct DiscoveredEntry {
     pub is_directory: bool,
     pub is_reparse_point: bool,
     pub inaccessible: bool,
+    pub is_sparse: bool,
+    pub is_compressed: bool,
+    pub is_encrypted: bool,
+    pub has_named_stream: bool,
     pub logical_bytes: u64,
     pub allocated_bytes: u64,
     pub modified_at_ms: Option<i64>,
@@ -50,6 +56,10 @@ impl ArenaBuilder {
             is_directory: true,
             is_reparse_point: false,
             inaccessible: false,
+            is_sparse: false,
+            is_compressed: false,
+            is_encrypted: false,
+            has_named_stream: false,
             logical_bytes: 0,
             allocated_bytes: 0,
             modified_at_ms: None,
@@ -190,6 +200,18 @@ fn new_node(name: NameRef, parent: Option<u32>, entry: &DiscoveredEntry) -> Aren
     }
     if entry.hard_link_alias {
         flags |= RAW_NODE_FLAG_HARD_LINK_ALIAS;
+    }
+    if entry.is_sparse {
+        flags |= RAW_NODE_FLAG_SPARSE;
+    }
+    if entry.is_compressed {
+        flags |= RAW_NODE_FLAG_COMPRESSED;
+    }
+    if entry.has_named_stream {
+        flags |= RAW_NODE_FLAG_NAMED_STREAM;
+    }
+    if entry.is_encrypted {
+        flags |= RAW_NODE_FLAG_ENCRYPTED;
     }
 
     ArenaNode {
@@ -333,6 +355,18 @@ impl ScanArena {
         if node.is_hard_link_alias() {
             attributes.push("hard_link_alias".to_owned());
         }
+        if node.is_sparse() {
+            attributes.push("sparse".to_owned());
+        }
+        if node.is_compressed() {
+            attributes.push("compressed".to_owned());
+        }
+        if node.has_named_stream() {
+            attributes.push("alternate_data_stream".to_owned());
+        }
+        if node.is_encrypted() {
+            attributes.push("encrypted".to_owned());
+        }
 
         ItemRow {
             id: self.node_id(index),
@@ -450,6 +484,10 @@ mod tests {
             is_directory: false,
             is_reparse_point: false,
             inaccessible: false,
+            is_sparse: false,
+            is_compressed: false,
+            is_encrypted: false,
+            has_named_stream: false,
             logical_bytes: allocated,
             allocated_bytes: allocated,
             modified_at_ms: None,

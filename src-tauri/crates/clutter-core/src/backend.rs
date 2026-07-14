@@ -53,6 +53,7 @@ impl ScanBackendEngine for TraversalBackend {
         on_progress: &mut dyn FnMut(ScanProgress),
     ) -> Result<ScanOutput, ScanFailure> {
         let started = Instant::now();
+        let started_at_ms = unix_epoch_ms();
         let root = PathBuf::from(&request.target.display_path);
         let mut builder = ArenaBuilder::new(root.clone())?;
         let mut hard_links = HashSet::new();
@@ -66,6 +67,10 @@ impl ScanBackendEngine for TraversalBackend {
             detail:
                 "Read-only filesystem traversal is active; the elevated MFT helper is not in use"
                     .to_owned(),
+        });
+        warning_ledger.record(ScanWarning {
+            code: "ALTERNATE_DATA_STREAMS_UNAVAILABLE".to_owned(),
+            detail: "Traversal totals do not include NTFS named data streams".to_owned(),
         });
         on_progress(progress(
             &session_id,
@@ -148,6 +153,8 @@ impl ScanBackendEngine for TraversalBackend {
             allocated_bytes: arena.allocated_bytes().to_string(),
             volume_used_bytes: volume_used_bytes.map(|value| value.to_string()),
             unaccounted_bytes,
+            started_at_ms: started_at_ms.to_string(),
+            completed_at_ms: "0".to_owned(),
             elapsed_ms: elapsed_ms(started.elapsed()).to_string(),
             warnings,
         };
@@ -161,7 +168,8 @@ impl ScanBackendEngine for TraversalBackend {
             started.elapsed(),
             Vec::new(),
         ));
-        let analyzer = AnalyzerIndex::build(&arena, coverage);
+        let analyzer = AnalyzerIndex::build(&arena, coverage, &summary.target);
+        summary.completed_at_ms = unix_epoch_ms().to_string();
         summary.elapsed_ms = elapsed_ms(started.elapsed()).to_string();
         on_progress(progress(
             &session_id,
@@ -197,6 +205,7 @@ impl ScanBackendEngine for RawNtfsBackend {
         #[cfg(windows)]
         {
             let started = Instant::now();
+            let started_at_ms = unix_epoch_ms();
             on_progress(progress(
                 &session_id,
                 ScanPhase::Elevating,
@@ -206,23 +215,26 @@ impl ScanBackendEngine for RawNtfsBackend {
                 started.elapsed(),
                 Vec::new(),
             ));
-            let mut helper_progress = |phase, records_seen, _mft_bytes_read, elapsed_ms| {
-                let phase = match phase {
-                    clutter_protocol::RawScanPhase::Preparing => ScanPhase::Preparing,
-                    clutter_protocol::RawScanPhase::Enumerating => ScanPhase::Enumerating,
-                    clutter_protocol::RawScanPhase::Indexing => ScanPhase::Indexing,
-                    clutter_protocol::RawScanPhase::Finalizing => ScanPhase::Finalizing,
+            let mut helper_progress =
+                |phase, records_seen, _mft_bytes_read, allocated_bytes, elapsed_ms| {
+                    let phase = match phase {
+                        clutter_protocol::RawScanPhase::Preparing
+                        | clutter_protocol::RawScanPhase::CheckingJournal
+                        | clutter_protocol::RawScanPhase::ReadingMetadata => ScanPhase::Preparing,
+                        clutter_protocol::RawScanPhase::Enumerating => ScanPhase::Enumerating,
+                        clutter_protocol::RawScanPhase::Indexing => ScanPhase::Indexing,
+                        clutter_protocol::RawScanPhase::Finalizing => ScanPhase::Finalizing,
+                    };
+                    on_progress(progress(
+                        &session_id,
+                        phase,
+                        self.kind(),
+                        records_seen,
+                        allocated_bytes,
+                        Duration::from_millis(elapsed_ms),
+                        Vec::new(),
+                    ));
                 };
-                on_progress(progress(
-                    &session_id,
-                    phase,
-                    self.kind(),
-                    records_seen,
-                    0,
-                    Duration::from_millis(elapsed_ms),
-                    Vec::new(),
-                ));
-            };
             let mut product = crate::raw_snapshot::scan_with_helper(
                 &request.target.display_path,
                 PathBuf::from(&request.target.display_path),
@@ -274,6 +286,8 @@ impl ScanBackendEngine for RawNtfsBackend {
                 allocated_bytes: product.arena.allocated_bytes().to_string(),
                 volume_used_bytes: volume_used_bytes.map(|value| value.to_string()),
                 unaccounted_bytes,
+                started_at_ms: started_at_ms.to_string(),
+                completed_at_ms: "0".to_owned(),
                 elapsed_ms: elapsed_ms(started.elapsed()).to_string(),
                 warnings: product.warnings,
             };
@@ -286,7 +300,8 @@ impl ScanBackendEngine for RawNtfsBackend {
                 started.elapsed(),
                 Vec::new(),
             ));
-            let analyzer = AnalyzerIndex::build(&product.arena, coverage);
+            let analyzer = AnalyzerIndex::build(&product.arena, coverage, &summary.target);
+            summary.completed_at_ms = unix_epoch_ms().to_string();
             summary.elapsed_ms = elapsed_ms(started.elapsed()).to_string();
             on_progress(progress(
                 &session_id,
@@ -415,6 +430,14 @@ fn elapsed_ms(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
+fn unix_epoch_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| {
+            u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+        })
+}
+
 #[cfg(windows)]
 fn raw_journal_changed(statistics: &clutter_protocol::RawScanStatistics) -> bool {
     match (
@@ -467,7 +490,7 @@ mod tests {
     use super::*;
     use crate::{
         arena::DiscoveredEntry,
-        scan::{ScanTarget, ScanTargetKind},
+        scan::{ItemQuery, ItemSort, ScanTarget, ScanTargetKind, SortDirection},
     };
 
     #[test]
@@ -556,6 +579,82 @@ mod tests {
         assert!(raw_journal_changed(&advanced));
     }
 
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires Windows elevation and benchmarks a real NTFS volume"]
+    fn elevated_raw_usable_view_benchmark() -> Result<(), ScanFailure> {
+        let target =
+            std::env::var("CLUTTERHUNTER_TEST_VOLUME").unwrap_or_else(|_| "C:\\".to_owned());
+        let runs = std::env::var("CLUTTERHUNTER_BENCH_RUNS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(3)
+            .clamp(1, 9);
+        let mut scan_times = Vec::with_capacity(runs);
+        let mut first_view_times = Vec::with_capacity(runs);
+
+        for run in 0..runs {
+            let request = ScanRequest {
+                target: ScanTarget {
+                    id: format!("benchmark-{run}"),
+                    kind: ScanTargetKind::Volume,
+                    display_path: target.clone(),
+                    filesystem: Some("NTFS".to_owned()),
+                    volume_id: None,
+                    total_bytes: None,
+                    available_bytes: None,
+                    fast_scan_available: true,
+                },
+                preferred_backend: ScanBackend::RawNtfs,
+            };
+            let started = Instant::now();
+            let output = RawNtfsBackend.scan(
+                request,
+                format!("usable-view-benchmark-{run}"),
+                Arc::new(AtomicBool::new(false)),
+                &mut |_| {},
+            )?;
+            let scan_ms = started.elapsed().as_millis();
+            let query_started = Instant::now();
+            let page = output.analyzer.query(
+                &output.arena,
+                &ItemQuery {
+                    sort: ItemSort::Allocated,
+                    direction: SortDirection::Desc,
+                    limit: 50,
+                    ..ItemQuery::default()
+                },
+            )?;
+            let first_view_ms = query_started.elapsed().as_millis();
+            let rust_bytes = output
+                .arena
+                .estimated_memory_bytes()
+                .saturating_add(output.analyzer.estimated_memory_bytes());
+            println!(
+                "usable_view_run={} entries={} scan_classify_ms={} first_query_ms={} rust_bytes={} rows={} coverage={:?}",
+                run + 1,
+                output.arena.entry_count(),
+                scan_ms,
+                first_view_ms,
+                rust_bytes,
+                page.items.len(),
+                output.summary.coverage,
+            );
+            scan_times.push(scan_ms);
+            first_view_times.push(first_view_ms);
+        }
+
+        scan_times.sort_unstable();
+        first_view_times.sort_unstable();
+        println!(
+            "usable_view_median runs={} scan_classify_ms={} first_query_ms={}",
+            runs,
+            scan_times[runs / 2],
+            first_view_times[runs / 2],
+        );
+        Ok(())
+    }
+
     fn file_entry(allocated_bytes: u64) -> DiscoveredEntry {
         DiscoveredEntry {
             temporary_id: 1,
@@ -564,6 +663,10 @@ mod tests {
             is_directory: false,
             is_reparse_point: false,
             inaccessible: false,
+            is_sparse: false,
+            is_compressed: false,
+            is_encrypted: false,
+            has_named_stream: false,
             logical_bytes: allocated_bytes,
             allocated_bytes,
             modified_at_ms: None,

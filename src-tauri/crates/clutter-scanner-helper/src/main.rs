@@ -1,6 +1,9 @@
 use clutter_protocol::PROTOCOL_VERSION;
 
 #[cfg(windows)]
+const RAW_SCAN_STALL_TIMEOUT_MS: u64 = 15_000;
+
+#[cfg(windows)]
 mod raw_mft;
 
 #[cfg(windows)]
@@ -30,8 +33,8 @@ fn run_stream(target: &str, pipe: &str, nonce: &str) {
         fs::OpenOptions,
         io::BufWriter,
         sync::{
-            Arc,
-            atomic::{AtomicBool, Ordering},
+            Arc, Mutex,
+            atomic::{AtomicBool, AtomicU64, Ordering},
         },
         thread,
         time::{Duration, Instant},
@@ -56,24 +59,34 @@ fn run_stream(target: &str, pipe: &str, nonce: &str) {
         eprintln!("Stream pipe does not match the scan nonce");
         std::process::exit(64);
     }
-    let file = (0..100)
-        .find_map(
-            |_| match OpenOptions::new().read(true).write(true).open(pipe) {
-                Ok(file) => Some(file),
-                Err(_) => {
-                    thread::sleep(Duration::from_millis(50));
-                    None
-                }
-            },
-        )
+    let stream_file = (0..100)
+        .find_map(|_| match OpenOptions::new().write(true).open(pipe) {
+            Ok(file) => Some(file),
+            Err(_) => {
+                thread::sleep(Duration::from_millis(50));
+                None
+            }
+        })
         .unwrap_or_else(|| {
             eprintln!("Could not connect to the scanner stream pipe");
             std::process::exit(1);
         });
-    let mut cancel_reader = file.try_clone().unwrap_or_else(|error| {
-        eprintln!("Could not open the scanner cancellation stream: {error}");
-        std::process::exit(1);
-    });
+    let cancel_pipe = format!(
+        "\\\\.\\pipe\\ClutterHunter-cancel-{nonce}",
+        nonce = encode_nonce(&nonce)
+    );
+    let mut cancel_reader = (0..100)
+        .find_map(|_| match OpenOptions::new().read(true).open(&cancel_pipe) {
+            Ok(file) => Some(file),
+            Err(_) => {
+                thread::sleep(Duration::from_millis(50));
+                None
+            }
+        })
+        .unwrap_or_else(|| {
+            eprintln!("Could not connect to the scanner cancellation pipe");
+            std::process::exit(1);
+        });
     let cancelled = Arc::new(AtomicBool::new(false));
     let cancellation_flag = Arc::clone(&cancelled);
     thread::spawn(move || {
@@ -81,7 +94,7 @@ fn run_stream(target: &str, pipe: &str, nonce: &str) {
             cancellation_flag.store(true, Ordering::Release);
         }
     });
-    let mut writer = BufWriter::with_capacity(1024 * 1024, file);
+    let mut writer = BufWriter::with_capacity(1024 * 1024, stream_file);
     if let Err(error) = send_frame(
         &mut writer,
         &HelperMessage::Hello(HelperHello {
@@ -94,22 +107,90 @@ fn run_stream(target: &str, pipe: &str, nonce: &str) {
         eprintln!("Could not start scanner stream: {error}");
         std::process::exit(1);
     }
+    let writer = Arc::new(Mutex::new(writer));
+
+    let scan_thread_id = unsafe { windows::Win32::System::Threading::GetCurrentThreadId() };
+    let watchdog_started = Instant::now();
+    let last_progress_ms = Arc::new(AtomicU64::new(0));
+    let last_phase = Arc::new(Mutex::new(None));
+    let scan_finished = Arc::new(AtomicBool::new(false));
+    let watchdog_progress = Arc::clone(&last_progress_ms);
+    let watchdog_phase = Arc::clone(&last_phase);
+    let watchdog_finished = Arc::clone(&scan_finished);
+    let watchdog_writer = Arc::clone(&writer);
+    thread::spawn(move || {
+        loop {
+            thread::sleep(Duration::from_millis(250));
+            if watchdog_finished.load(Ordering::Acquire) {
+                return;
+            }
+            let now_ms = u64::try_from(watchdog_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            let previous_ms = watchdog_progress.load(Ordering::Acquire);
+            if now_ms.saturating_sub(previous_ms) >= RAW_SCAN_STALL_TIMEOUT_MS {
+                let phase = watchdog_phase.lock().ok().and_then(|phase| *phase);
+                let detail = format!(
+                    "The raw NTFS scanner made no progress for 15 seconds; last phase: {phase:?}"
+                );
+                let _ = send_shared_frame(
+                    &watchdog_writer,
+                    &HelperMessage::Error {
+                        code: "RAW_NTFS_SCAN_STALLED".to_owned(),
+                        recoverable: true,
+                        detail,
+                    },
+                );
+                if let Ok(scan_thread) = unsafe {
+                    windows::Win32::System::Threading::OpenThread(
+                        windows::Win32::System::Threading::THREAD_TERMINATE,
+                        false,
+                        scan_thread_id,
+                    )
+                } {
+                    let _ = unsafe { windows::Win32::System::IO::CancelSynchronousIo(scan_thread) };
+                    let _ = unsafe { windows::Win32::Foundation::CloseHandle(scan_thread) };
+                }
+                for _ in 0..10 {
+                    if watchdog_finished.load(Ordering::Acquire) {
+                        return;
+                    }
+                    thread::sleep(Duration::from_millis(100));
+                }
+                eprintln!("RAW_NTFS_SCAN_STALLED: the scanner made no progress for 15 seconds");
+                let _ = unsafe {
+                    windows::Win32::System::Threading::TerminateProcess(
+                        windows::Win32::System::Threading::GetCurrentProcess(),
+                        70,
+                    )
+                };
+                std::process::abort();
+            }
+        }
+    });
 
     let scan = raw_mft::scan(
         target,
         || cancelled.load(Ordering::Acquire),
-        |phase, records, bytes, elapsed| {
-            send_frame(
-                &mut writer,
+        |phase, records, mft_bytes, allocated_bytes, elapsed| {
+            if let Ok(mut last_phase) = last_phase.lock() {
+                *last_phase = Some(phase);
+            }
+            last_progress_ms.store(
+                u64::try_from(watchdog_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                Ordering::Release,
+            );
+            send_shared_frame(
+                &writer,
                 &HelperMessage::Progress {
                     phase,
                     records_seen: records,
-                    mft_bytes_read: bytes,
+                    mft_bytes_read: mft_bytes,
+                    allocated_bytes,
                     elapsed_ms: elapsed,
                 },
             )
         },
     );
+    scan_finished.store(true, Ordering::Release);
     let result = scan.and_then(|product| {
         let stream_started = Instant::now();
         let raw_mft::ScanProduct {
@@ -122,16 +203,16 @@ fn run_stream(target: &str, pipe: &str, nonce: &str) {
             .map_err(|_| "the raw arena exceeded its stream node limit".to_owned())?;
         let name_bytes = u32::try_from(names.len())
             .map_err(|_| "the raw arena exceeded its stream name limit".to_owned())?;
-        send_frame(
-            &mut writer,
+        send_shared_frame(
+            &writer,
             &HelperMessage::ArenaHeader {
                 node_count,
                 name_bytes,
             },
         )?;
         for warning in warnings {
-            send_frame(
-                &mut writer,
+            send_shared_frame(
+                &writer,
                 &HelperMessage::Warning {
                     code: warning.code,
                     detail: warning.detail,
@@ -139,8 +220,8 @@ fn run_stream(target: &str, pipe: &str, nonce: &str) {
             )?;
         }
         for (sequence, batch) in nodes.chunks(RAW_NODE_BATCH_SIZE).enumerate() {
-            send_frame(
-                &mut writer,
+            send_shared_frame(
+                &writer,
                 &HelperMessage::NodeBatch {
                     sequence: sequence as u32,
                     nodes: batch.to_vec(),
@@ -148,8 +229,8 @@ fn run_stream(target: &str, pipe: &str, nonce: &str) {
             )?;
         }
         for (sequence, batch) in names.chunks(RAW_NAME_BATCH_SIZE).enumerate() {
-            send_frame(
-                &mut writer,
+            send_shared_frame(
+                &writer,
                 &HelperMessage::NameBatch {
                     sequence: sequence as u32,
                     bytes: batch.to_vec(),
@@ -159,7 +240,7 @@ fn run_stream(target: &str, pipe: &str, nonce: &str) {
         statistics.stream_ms =
             u64::try_from(stream_started.elapsed().as_millis()).unwrap_or(u64::MAX);
         statistics.helper_peak_working_set_bytes = process_peak_working_set_bytes().unwrap_or(0);
-        send_frame(&mut writer, &HelperMessage::Complete { statistics })
+        send_shared_frame(&writer, &HelperMessage::Complete { statistics })
     });
     if let Err(detail) = result {
         let code = if detail == "scan cancelled" {
@@ -167,8 +248,8 @@ fn run_stream(target: &str, pipe: &str, nonce: &str) {
         } else {
             "RAW_NTFS_SCAN_FAILED"
         };
-        let _ = send_frame(
-            &mut writer,
+        let _ = send_shared_frame(
+            &writer,
             &HelperMessage::Error {
                 code: code.to_owned(),
                 recoverable: true,
@@ -220,6 +301,17 @@ fn send_frame(
         .and_then(|_| writer.write_all(&bytes))
         .and_then(|_| writer.flush())
         .map_err(|error| error.to_string())
+}
+
+#[cfg(windows)]
+fn send_shared_frame(
+    writer: &std::sync::Arc<std::sync::Mutex<std::io::BufWriter<std::fs::File>>>,
+    message: &clutter_protocol::HelperMessage,
+) -> Result<(), String> {
+    let mut writer = writer
+        .lock()
+        .map_err(|_| "the scanner stream writer state was unavailable".to_owned())?;
+    send_frame(&mut *writer, message)
 }
 
 #[cfg(windows)]
@@ -357,7 +449,11 @@ fn run_snapshot(target: &str, output: &str, cancel: &str, nonce: &str) {
             std::process::exit(64);
         }
     };
-    let outcome = match raw_mft::scan(target, || Path::new(cancel).exists(), |_, _, _, _| Ok(())) {
+    let outcome = match raw_mft::scan(
+        target,
+        || Path::new(cancel).exists(),
+        |_, _, _, _, _| Ok(()),
+    ) {
         Ok(product) => RawScanOutcome::Complete {
             arena: product.arena,
             statistics: Box::new(product.statistics),
