@@ -47,12 +47,28 @@ describe.skipIf(!liveModel)("live Ollama agent runtime", () => {
       preparedModel,
     });
     const scopedResult = await scopedSession.streamTurn(
-      "Call query_storage_items once with scope Projects, sort allocated, direction desc, and limit 5. Report the largest returned item by name.",
+      "Call list_folder_children once with scope Projects, sort allocated, direction desc, and limit 5. Report the largest returned item by name.",
       () => undefined,
     );
     expect(scopedResult.activities.some((activity) =>
-      activity.tool === "query_storage_items" && activity.state === "completed")).toBe(true);
+      activity.tool === "list_folder_children" && activity.state === "completed")).toBe(true);
     expect(scopedResult.text).toMatch(/bundle\.zip/i);
+
+    const followUpResult = await scopedSession.streamTurn(
+      "All files? Keep the same folder scope and use a fresh storage query.",
+      () => undefined,
+    );
+    expect(followUpResult.activities.some((activity) =>
+      activity.tool === "list_folder_children" && activity.state === "completed")).toBe(true);
+    expect(followUpResult.text).toMatch(/C:\\Users\\person\\Projects\\bundle\.zip/i);
+
+    const largestFiles = await scopedSession.streamTurn(
+      "Show the top 5 files anywhere under Projects by allocated size.",
+      () => undefined,
+    );
+    expect(largestFiles.activities.some((activity) =>
+      activity.tool === "list_largest_items" && activity.state === "completed")).toBe(true);
+    expect(largestFiles.text).toMatch(/bundle\.zip/i);
 
     const attachedSession = runtime.createSession({
       sessionId: "live-agent-fixture",
@@ -73,8 +89,34 @@ describe.skipIf(!liveModel)("live Ollama agent runtime", () => {
       () => undefined,
     );
     expect(attachedResult.activities.some((activity) =>
-      activity.tool === "query_storage_items" && activity.state === "completed")).toBe(true);
+      activity.tool === "list_folder_children" && activity.state === "completed")).toBe(true);
     expect(attachedResult.text).toMatch(/bundle\.zip/i);
+
+    const inspectionSession = runtime.createSession({
+      sessionId: "live-agent-fixture",
+      workflow: "investigate",
+      preparedModel,
+    });
+    const inspection = await inspectionSession.streamTurn(
+      "Call inspect_folder exactly once with scope Projects and limit 10. Explain why it is large from returned evidence only.",
+      () => undefined,
+    );
+    expect(inspection.activities.some((activity) =>
+      activity.tool === "inspect_folder" && activity.state === "completed")).toBe(true);
+    expect(inspection.text).toMatch(/bundle\.zip/i);
+
+    const cleanupSession = runtime.createSession({
+      sessionId: "live-agent-fixture",
+      workflow: "investigate",
+      preparedModel,
+    });
+    const opportunities = await cleanupSession.streamTurn(
+      "Call list_cleanup_opportunities exactly once with scope Projects, include_review true, and limit 25. Use only its deterministic evidence.",
+      () => undefined,
+    );
+    expect(opportunities.activities.some((activity) =>
+      activity.tool === "list_cleanup_opportunities" && activity.state === "completed")).toBe(true);
+    expect(opportunities.text).toMatch(/Synthetic cache/i);
 
     const attachedEvidenceSession = runtime.createSession({
       sessionId: "live-agent-fixture",
@@ -91,11 +133,11 @@ describe.skipIf(!liveModel)("live Ollama agent runtime", () => {
       policyTier: fixtureDirectory.policy.tier,
     });
     const attachedEvidence = await attachedEvidenceSession.streamTurn(
-      "Call get_item_evidence exactly once with use_attached_item true. Do not copy an item ID.",
+      "Call inspect_item exactly once with use_attached_item true. Do not copy an item ID.",
       () => undefined,
     );
     expect(attachedEvidence.activities.some((activity) =>
-      activity.tool === "get_item_evidence"
+      activity.tool === "inspect_item"
       && activity.state === "completed"
       && activity.arguments.use_attached_item === true)).toBe(true);
 
@@ -157,6 +199,24 @@ const fixturePlan: CleanupPlan = {
   omitted_candidate_bytes: "0",
   omitted_review_bytes: "0",
   items: [],
+};
+
+const fixtureOpportunityPlan: CleanupPlan = {
+  ...fixturePlan,
+  selected_candidate_bytes: "1073741824",
+  review_potential_bytes: "2147483648",
+  items: [{
+    id: "cleanup-fixture",
+    node_ids: ["log-1"],
+    title: "Synthetic cache",
+    category: "cache",
+    tier: "cleanup_candidate",
+    selected: true,
+    reclaimable_bytes: "1073741824",
+    evidence: [],
+    warnings: [],
+    action_kind: "none",
+  }],
 };
 
 const fixtureSummary: ScanSummary = {
@@ -261,7 +321,8 @@ const fixtureExcerpt: LogExcerptBatch = {
 function createFixtureInvoke(invoked: string[]): AnalyzerInvoke {
   return async <T>(command: string, args?: Record<string, unknown>): Promise<T> => {
     invoked.push(command);
-    const query = args?.query as { text?: string; scope_id?: string } | undefined;
+    const query = args?.query as { text?: string; parent_id?: string; scope_id?: string } | undefined;
+    const nodeId = typeof args?.nodeId === "string" ? args.nodeId : null;
     const result = command === "get_hardware_profile"
       ? { total_memory_bytes: "8000000000", available_memory_bytes: "4000000000" }
       : command === "get_scan_summary"
@@ -269,11 +330,28 @@ function createFixtureInvoke(invoked: string[]): AnalyzerInvoke {
         : command === "query_items"
           ? query?.text === "Projects"
             ? { items: [fixtureDirectory], next_cursor: null }
-            : query?.scope_id === fixtureDirectory.id
+            : query?.parent_id === fixtureDirectory.id || query?.scope_id === fixtureDirectory.id
               ? fixtureScopedPage
               : fixturePage
           : command === "get_item_details"
-            ? fixtureDetails
+            ? nodeId === fixtureDirectory.id
+              ? { item: fixtureDirectory, evidence: fixtureDirectory.policy }
+              : fixtureDetails
+            : command === "get_storage_aggregate"
+              ? {
+                  buckets: [{
+                    key: "file",
+                    label: "File",
+                    item_count: "1",
+                    logical_bytes: "1073741824",
+                    allocated_bytes: "1073741824",
+                  }],
+                  other_item_count: "0",
+                  other_logical_bytes: "0",
+                  other_allocated_bytes: "0",
+                }
+              : command === "get_cleanup_opportunities"
+                ? fixtureOpportunityPlan
             : command === "build_cleanup_plan"
               ? fixturePlan
               : command === "inspect_log_excerpt"

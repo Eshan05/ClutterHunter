@@ -1,7 +1,7 @@
 use std::{
     borrow::Cow,
-    cmp::Ordering,
-    collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    cmp::{Ordering, Reverse},
+    collections::{BTreeMap, BinaryHeap, HashMap, HashSet, VecDeque},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering as AtomicOrdering},
@@ -521,18 +521,24 @@ impl AnalyzerIndex {
         validate_decimal_filter(query.min_bytes.as_deref(), "min_bytes")?;
         validate_decimal_filter(query.modified_before_ms.as_deref(), "modified_before_ms")?;
         validate_query_id(query.query_id.as_deref())?;
-        let recursive = query
-            .text
-            .as_ref()
-            .is_some_and(|text| !text.trim().is_empty())
-            || query.kinds.is_some()
-            || query.extensions.is_some()
-            || query.policy_tiers.is_some()
-            || query.owner_ids.is_some()
-            || query.min_bytes.is_some()
-            || query.modified_before_ms.is_some();
+        let top_only = query.top_only.unwrap_or(false);
+        if top_only
+            && (query.cursor.is_some()
+                || query.direction != SortDirection::Desc
+                || !matches!(query.sort, ItemSort::Allocated | ItemSort::Logical))
+        {
+            return Err(ScanFailure::new(
+                "INVALID_QUERY",
+                "top_only queries require descending allocated or logical size and no cursor",
+                true,
+            ));
+        }
+        let recursive = query.recursive;
+        let limit = usize::from(query.limit.clamp(1, 100));
         let signature = query_fingerprint(query, scope);
-        let candidates = if recursive {
+        let candidates = if recursive && top_only {
+            self.top_ranked_descendants(arena, scope, query, limit, cancel)?
+        } else if recursive {
             let mut candidates = Vec::new();
             visit_descendants(arena, scope, cancel, |index| {
                 if self.matches(arena, index, query) {
@@ -567,7 +573,6 @@ impl AnalyzerIndex {
                 true,
             ));
         }
-        let limit = usize::from(query.limit.clamp(1, 100));
         let end = start.saturating_add(limit).min(candidates.len());
         let items = candidates[start..end]
             .iter()
@@ -575,6 +580,42 @@ impl AnalyzerIndex {
             .collect();
         let next_cursor = (end < candidates.len()).then(|| query_cursor(arena, signature, end));
         Ok(ItemPage { items, next_cursor })
+    }
+
+    fn top_ranked_descendants(
+        &self,
+        arena: &ScanArena,
+        scope: u32,
+        query: &ItemQuery,
+        limit: usize,
+        cancel: &AtomicBool,
+    ) -> Result<Arc<[u32]>, ScanFailure> {
+        let mut top = BinaryHeap::<Reverse<(u64, Reverse<u32>)>>::with_capacity(limit + 1);
+        visit_descendants(arena, scope, cancel, |index| {
+            if !self.matches(arena, index, query) {
+                return;
+            }
+            let Some(node) = arena.node(index) else {
+                return;
+            };
+            let bytes = match query.sort {
+                ItemSort::Logical => node.logical_bytes,
+                _ => node.allocated_bytes,
+            };
+            top.push(Reverse((bytes, Reverse(index))));
+            if top.len() > limit {
+                top.pop();
+            }
+        })?;
+        let mut candidates: Vec<_> = top
+            .into_iter()
+            .map(|Reverse((_, Reverse(index)))| index)
+            .collect();
+        candidates.sort_unstable_by(|left, right| {
+            self.compare(arena, *right, *left, query.sort)
+                .then_with(|| left.cmp(right))
+        });
+        Ok(Arc::from(candidates))
     }
 
     fn sorted_children(
@@ -758,14 +799,42 @@ impl AnalyzerIndex {
         arena: &ScanArena,
         request: &CleanupPlanRequest,
     ) -> Result<CleanupPlan, ScanFailure> {
+        self.build_plan_in_scope(arena, request, None)
+    }
+
+    pub fn build_plan_in_scope(
+        &self,
+        arena: &ScanArena,
+        request: &CleanupPlanRequest,
+        scope_id: Option<&str>,
+    ) -> Result<CleanupPlan, ScanFailure> {
         let target = request
             .target_bytes
             .as_deref()
             .map(|value| parse_decimal(value, "target_bytes"))
             .transpose()?;
+        let scope = scope_id
+            .map(|id| arena.parse_node_id(id))
+            .transpose()?
+            .unwrap_or(0);
         let uniform_candidates = self.uniform_candidate_rules(arena);
         let mut opportunities = Vec::<PlanOpportunity>::new();
-        for index in 1..arena.node_count() as u32 {
+        let mut pending = Vec::new();
+        if scope == 0 {
+            let mut child = arena.node(0).map_or(NO_INDEX, |node| node.first_child);
+            while child != NO_INDEX {
+                pending.push(child);
+                child = arena.node(child).map_or(NO_INDEX, |node| node.next_sibling);
+            }
+        } else {
+            pending.push(scope);
+        }
+        while let Some(index) = pending.pop() {
+            let mut child = arena.node(index).map_or(NO_INDEX, |node| node.first_child);
+            while child != NO_INDEX {
+                pending.push(child);
+                child = arena.node(child).map_or(NO_INDEX, |node| node.next_sibling);
+            }
             let rule = self.effective_rule(index);
             let tier = self.effective_tier(index);
             if tier == PolicyTier::Protected || self.coverage != ScanCoverage::Complete {
@@ -1624,6 +1693,8 @@ fn invalid_cursor() -> ScanFailure {
 fn query_fingerprint(query: &ItemQuery, scope: u32) -> u64 {
     let mut fingerprint = Fingerprint::default();
     fingerprint.u64(u64::from(scope));
+    fingerprint.byte(u8::from(query.recursive));
+    fingerprint.byte(u8::from(query.top_only.unwrap_or(false)));
     fingerprint.optional_string(query.text.as_deref());
     fingerprint.optional_values(query.kinds.as_deref(), |fingerprint, value| {
         fingerprint.byte(match value {
@@ -1831,6 +1902,7 @@ mod tests {
             &arena,
             &ItemQuery {
                 text: Some("cache".to_owned()),
+                recursive: true,
                 min_bytes: Some("10".to_owned()),
                 sort: ItemSort::Allocated,
                 direction: SortDirection::Desc,
@@ -1841,6 +1913,64 @@ mod tests {
         assert_eq!(page.items.len(), 1);
         assert_eq!(page.items[0].name, "Cache");
         assert_eq!(page.items[0].policy.tier, PolicyTier::CleanupCandidate);
+        Ok(())
+    }
+
+    #[test]
+    fn filtered_child_lists_do_not_become_recursive_searches() -> Result<(), ScanFailure> {
+        let (arena, analyzer) = fixture(ScanCoverage::Complete)?;
+        let direct = analyzer.query(
+            &arena,
+            &ItemQuery {
+                kinds: Some(vec![ItemKind::Directory]),
+                sort: ItemSort::Allocated,
+                direction: SortDirection::Desc,
+                ..ItemQuery::default()
+            },
+        )?;
+        let recursive = analyzer.query(
+            &arena,
+            &ItemQuery {
+                recursive: true,
+                kinds: Some(vec![ItemKind::Directory]),
+                sort: ItemSort::Allocated,
+                direction: SortDirection::Desc,
+                ..ItemQuery::default()
+            },
+        )?;
+
+        assert_eq!(direct.items.len(), 2);
+        assert!(
+            direct
+                .items
+                .iter()
+                .all(|item| item.parent_id == Some(arena.node_id(0)))
+        );
+        assert_eq!(recursive.items.len(), 3);
+        assert!(recursive.items.iter().any(|item| item.name == "Cache"));
+        Ok(())
+    }
+
+    #[test]
+    fn top_only_query_keeps_a_bounded_recursive_size_ranking() -> Result<(), ScanFailure> {
+        let (arena, analyzer) = fixture(ScanCoverage::Complete)?;
+        let page = analyzer.query(
+            &arena,
+            &ItemQuery {
+                recursive: true,
+                top_only: Some(true),
+                kinds: Some(vec![ItemKind::File]),
+                sort: ItemSort::Allocated,
+                direction: SortDirection::Desc,
+                limit: 2,
+                ..ItemQuery::default()
+            },
+        )?;
+
+        assert_eq!(page.items.len(), 2);
+        assert_eq!(page.items[0].name, "package.bin");
+        assert_eq!(page.items[1].name, "data.bin");
+        assert!(page.next_cursor.is_none());
         Ok(())
     }
 
@@ -1887,6 +2017,7 @@ mod tests {
                 &arena,
                 &ItemQuery {
                     text: Some("cache".to_owned()),
+                    recursive: true,
                     query_id: Some("cancel-fixture".to_owned()),
                     ..ItemQuery::default()
                 },
@@ -2043,6 +2174,25 @@ mod tests {
         assert_eq!(plan.selected_review_bytes, "0");
         assert_eq!(plan.review_potential_bytes, "200");
         assert_eq!(plan.target_shortfall_bytes, "0");
+        Ok(())
+    }
+
+    #[test]
+    fn cleanup_opportunities_can_be_bounded_to_one_folder() -> Result<(), ScanFailure> {
+        let (arena, analyzer) = fixture(ScanCoverage::Complete)?;
+        let scope_id = arena.node_id(1);
+        let plan = analyzer.build_plan_in_scope(
+            &arena,
+            &CleanupPlanRequest { target_bytes: None },
+            Some(scope_id.as_str()),
+        )?;
+
+        assert!(plan.items.iter().all(|item| {
+            item.node_ids
+                .iter()
+                .all(|node_id| node_id != &arena.node_id(4) && node_id != &arena.node_id(5))
+        }));
+        assert_eq!(plan.selected_candidate_bytes, "100");
         Ok(())
     }
 
@@ -2237,6 +2387,7 @@ mod tests {
             &arena,
             &ItemQuery {
                 text: Some("xxxxxxxx".to_owned()),
+                recursive: true,
                 sort: ItemSort::Allocated,
                 direction: SortDirection::Desc,
                 limit: 50,

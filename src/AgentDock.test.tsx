@@ -186,6 +186,34 @@ describe("AgentDock", () => {
     expect(screen.getByRole("textbox", { name: "Message ClutterHunter" }).hasAttribute("disabled")).toBe(true);
   });
 
+  it("builds and edits a deterministic cleanup plan without Ollama", async () => {
+    const user = userEvent.setup();
+    mocks.discover.mockRejectedValueOnce(new Error("connection refused"));
+    render(<AgentDock desktopRuntime hidden={false} summary={summary} />);
+
+    await screen.findByText("Ollama unavailable");
+    await user.click(screen.getByRole("tab", { name: /Plan 0/i }));
+    await user.type(screen.getByRole("textbox", { name: "Cleanup target in GB" }), "1.5");
+    await user.click(screen.getByRole("button", { name: "Find cleanup" }));
+
+    expect(mocks.invoke).toHaveBeenCalledWith("build_cleanup_plan", {
+      sessionId: "scan-1",
+      request: { target_bytes: "1610612736" },
+    });
+    expect(await screen.findByText("Old crash report")).toBeTruthy();
+
+    await user.click(screen.getByRole("tab", { name: "Chat" }));
+    await user.selectOptions(screen.getByRole("combobox", { name: "Agent workflow" }), "plan");
+    await user.click(screen.getByRole("tab", { name: /Plan 1/i }));
+    expect(screen.getByText("Old crash report")).toBeTruthy();
+
+    await user.click(screen.getByRole("checkbox"));
+    expect(mocks.invoke).toHaveBeenCalledWith("edit_cleanup_plan", {
+      sessionId: "scan-1",
+      edit: { item_id: "plan-1", selected: false },
+    });
+  });
+
   it("requires confirmation before overriding a low-memory estimate", async () => {
     const user = userEvent.setup();
     mocks.discover.mockResolvedValueOnce({
@@ -246,6 +274,63 @@ describe("AgentDock", () => {
     expect(await screen.findByRole("region", { name: "Storage items" })).toBeTruthy();
     expect(screen.getByText("Downloads")).toBeTruthy();
     expect(screen.getByText("2.0 GB")).toBeTruthy();
+  });
+
+  it("renders folder inspection and cleanup opportunities as deterministic cards", async () => {
+    const user = userEvent.setup();
+    mocks.streamTurn.mockResolvedValue(turnResult({
+      text: "Local evidence ready.",
+      results: [{
+        component: "FolderInspectionResult",
+        data: {
+          scope: { display_path: "C:\\Work", allocated_bytes: "4294967296" },
+          top_children: [{ name: "target", display_path: "C:\\Work\\target", allocated_bytes: "3221225472" }],
+          top_files: [{ name: "model.bin", display_path: "C:\\Work\\target\\model.bin", allocated_bytes: "2147483648" }],
+          extension_buckets: [{ label: "bin", allocated_bytes: "2147483648" }],
+        },
+        truncated: false,
+        serializedBytes: 200,
+      }, {
+        component: "CleanupOpportunitiesResult",
+        data: {
+          conservative_bytes: "1073741824",
+          review_potential_bytes: "2147483648",
+          items: [{ title: "Generated build data", tier: "review_required", reclaimable_bytes: "2147483648" }],
+        },
+        truncated: false,
+        serializedBytes: 200,
+      }],
+    }));
+    render(<AgentDock desktopRuntime hidden={false} summary={summary} />);
+    await user.click(await screen.findByRole("button", { name: /Test & use/i }));
+    await screen.findByText("Ready for this scan");
+    await user.type(screen.getByRole("textbox", { name: "Message ClutterHunter" }), "Why is Work large and what can I clean?");
+    await user.click(screen.getByRole("button", { name: "Send message" }));
+
+    expect(await screen.findByRole("region", { name: "Folder inspection" })).toBeTruthy();
+    expect(screen.getByRole("region", { name: "Cleanup opportunities" })).toBeTruthy();
+    expect(screen.getByText("Child · target")).toBeTruthy();
+    expect(screen.getByText("File · model.bin")).toBeTruthy();
+    expect(screen.getByText("Type · bin")).toBeTruthy();
+    expect(screen.getByText(/Generated build data/)).toBeTruthy();
+  });
+
+  it("renders incomplete and completed assistant Markdown with Streamdown", async () => {
+    const user = userEvent.setup();
+    mocks.streamTurn.mockImplementation(async (_prompt, onText) => {
+      onText("**Grounded", "**Grounded");
+      onText(" answer**", "**Grounded answer**");
+      return turnResult({ text: "**Grounded answer**" });
+    });
+    render(<AgentDock desktopRuntime hidden={false} summary={summary} />);
+    await user.click(await screen.findByRole("button", { name: /Test & use/i }));
+    await screen.findByText("Ready for this scan");
+    await user.type(screen.getByRole("textbox", { name: "Message ClutterHunter" }), "Explain the result");
+    await user.click(screen.getByRole("button", { name: "Send message" }));
+
+    await waitFor(() => {
+      expect(screen.getByText("Grounded answer").getAttribute("data-streamdown")).toBe("strong");
+    });
   });
 
   it("attaches exact current analyzer metadata and allows removing it", async () => {

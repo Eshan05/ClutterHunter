@@ -29,6 +29,14 @@ export interface AnalyzerToolDependencies {
   invoke: AnalyzerInvoke;
   budget?: ToolResultBudget;
   attachment?: AnalyzerAttachment | null;
+  defaultScope?: AnalyzerQueryScope | null;
+  allowRootScope?: boolean;
+}
+
+export interface AnalyzerQueryScope {
+  id: string;
+  name: string;
+  display_path: string | null;
 }
 
 const byteString = z.string().regex(/^\d+$/, "Expected a non-negative decimal byte string");
@@ -37,6 +45,44 @@ const itemKind = z.enum(["file", "directory", "reparse_point"]);
 const itemSort = z.enum(["name", "allocated", "logical", "modified", "type", "policy", "owner"]);
 const sortDirection = z.enum(["asc", "desc"]);
 const aggregateDimension = z.enum(["extension", "owner", "policy", "kind"]);
+const storageQueryFields = {
+  kinds: z.array(itemKind).max(3).optional(),
+  extensions: z.array(z.string().max(32)).max(20).optional(),
+  policy_tiers: z.array(policyTier).max(3).optional(),
+  owner_ids: z.array(z.string().max(256)).max(20).optional(),
+  min_bytes: byteString.optional(),
+  modified_before_ms: byteString.optional(),
+  sort: itemSort.default("allocated"),
+  direction: sortDirection.default("desc"),
+  cursor: z.string().max(2_048).nullable().default(null),
+  limit: z.number().int().min(1).max(100).default(25),
+};
+const folderChildrenSchema = z.object({
+  scope: z.string().max(1_024).optional().describe("Folder name or path whose immediate children should be listed."),
+  ...storageQueryFields,
+});
+const storageSearchSchema = z.object({
+  scope: z.string().max(1_024).optional().describe("Optional folder name or path that bounds the recursive search."),
+  text: z.string().trim().min(1).max(256).describe("Required name or path text to search for."),
+  ...storageQueryFields,
+});
+const largestItemsSchema = z.object({
+  scope: z.string().max(1_024).optional().describe("Folder name or path that bounds the recursive ranking."),
+  kinds: z.array(itemKind).max(3).optional(),
+  extensions: z.array(z.string().max(32)).max(20).optional(),
+  policy_tiers: z.array(policyTier).max(3).optional(),
+  min_bytes: byteString.optional(),
+  modified_before_ms: byteString.optional(),
+  metric: z.enum(["allocated", "logical"]).default("allocated"),
+  limit: z.number().int().min(1).max(100).default(25),
+});
+
+export type StorageItemQueryInput = z.infer<typeof folderChildrenSchema> & {
+  text?: string;
+  recursive?: boolean;
+  topOnly?: boolean;
+  mode?: "children" | "search" | "largest";
+};
 
 export class ToolResultBudget {
   private usedBytes = 0;
@@ -64,6 +110,8 @@ export function createAnalyzerTools(dependencies: AnalyzerToolDependencies) {
   const invoke = dependencies.invoke;
   const sessionId = dependencies.sessionId;
   const attachment = dependencies.attachment ?? null;
+  const defaultScope = dependencies.defaultScope ?? null;
+  const allowRootScope = dependencies.allowRootScope ?? false;
 
   return {
     get_storage_overview: tool({
@@ -78,45 +126,101 @@ export function createAnalyzerTools(dependencies: AnalyzerToolDependencies) {
       },
     }),
 
-    query_storage_items: tool({
-      description: "Query at most 100 storage items. scope accepts a folder name, path, or exact returned item id and is resolved locally before querying inside it.",
+    list_folder_children: tool({
+      description: "List only the immediate children of a folder, with deterministic filters and sorting. Use search_storage instead for recursive name/path search.",
+      inputSchema: folderChildrenSchema,
+      execute: async (input) => queryStorageItems(dependencies, { ...input, mode: "children" }, budget),
+    }),
+
+    list_largest_items: tool({
+      description: "Rank the largest files or folders anywhere below one folder using a bounded recursive analyzer query. Use list_folder_children for immediate navigation.",
+      inputSchema: largestItemsSchema,
+      execute: async (input) => queryStorageItems(dependencies, {
+        ...input,
+        sort: input.metric,
+        direction: "desc",
+        cursor: null,
+        recursive: true,
+        topOnly: true,
+        mode: "largest",
+      }, budget),
+    }),
+
+    search_storage: tool({
+      description: "Recursively search storage names and paths across the scan or inside one resolved folder. A non-empty text query is required.",
+      inputSchema: storageSearchSchema,
+      execute: async (input) => queryStorageItems(dependencies, { ...input, recursive: true, mode: "search" }, budget),
+    }),
+
+    inspect_folder: tool({
+      description: "Explain one folder using its exact totals, largest immediate children, kind mix, policy mix, scan coverage, and warnings in one bounded local call.",
       inputSchema: z.object({
-        scope: z.string().max(1_024).optional().describe("Folder name, folder path, or exact item id to query inside."),
-        text: z.string().max(256).optional().describe("Optional item name/path filter inside scope, or across the scan when scope is omitted."),
-        kinds: z.array(itemKind).max(3).optional(),
-        extensions: z.array(z.string().max(32)).max(20).optional(),
-        policy_tiers: z.array(policyTier).max(3).optional(),
-        owner_ids: z.array(z.string().max(256)).max(20).optional(),
-        min_bytes: byteString.optional(),
-        modified_before_ms: byteString.optional(),
-        sort: itemSort.default("allocated"),
-        direction: sortDirection.default("desc"),
-        cursor: z.string().max(2_048).nullable().default(null),
-        limit: z.number().int().min(1).max(100).default(25),
+        scope: z.string().max(1_024).optional(),
+        limit: z.number().int().min(3).max(25).default(10),
       }),
-      execute: async (input) => {
-        const resolved = await resolveQueryScope(sessionId, input.scope, invoke, attachment);
-        if (resolved.result) return budget.wrap("ItemListResult", resolved.result);
-        const query: ItemQuery = {
-          parent_id: null,
-          scope_id: resolved.scope?.id,
-          text: input.text,
-          kinds: input.kinds,
-          extensions: input.extensions,
-          policy_tiers: input.policy_tiers,
-          owner_ids: input.owner_ids,
-          min_bytes: input.min_bytes,
-          modified_before_ms: input.modified_before_ms,
-          sort: input.sort,
-          direction: input.direction,
-          cursor: input.cursor,
-          limit: input.limit,
-        };
-        const page = await invoke<ItemPage>("query_items", { sessionId, query });
-        return budget.wrap(
-          "ItemListResult",
-          resolved.scope ? { ...page, resolved_scope: resolved.scope } : page,
+      execute: async (input) => inspectFolder(dependencies, input, budget),
+    }),
+
+    list_cleanup_opportunities: tool({
+      description: "List deterministic cleanup candidates and optional review opportunities inside one folder without creating or changing the cleanup plan.",
+      inputSchema: z.object({
+        scope: z.string().max(1_024).optional(),
+        include_review: z.boolean().default(true),
+        limit: z.number().int().min(1).max(50).default(25),
+      }),
+      execute: async ({ scope, include_review, limit }) => {
+        const resolved = await resolveQueryScope(
+          sessionId,
+          scope,
+          invoke,
+          attachment,
+          defaultScope,
+          allowRootScope,
         );
+        if (resolved.result) {
+          return budget.wrap("CleanupOpportunitiesResult", {
+            items: [],
+            conservative_bytes: "0",
+            review_potential_bytes: "0",
+            total_opportunity_count: 0,
+            returned_count: 0,
+            scope_candidates: resolved.result.scope_candidates ?? [],
+            query_note: resolved.result.query_note,
+          });
+        }
+        const plan = await invoke<CleanupPlan>("get_cleanup_opportunities", {
+          sessionId,
+          scopeId: resolved.scope?.id ?? null,
+        });
+        const eligible = plan.items.filter((item) => include_review || item.tier === "cleanup_candidate");
+        const items = await Promise.all(eligible.slice(0, limit).map(async (item) => {
+          const nodeId = item.node_ids[0];
+          const details = nodeId
+            ? await invoke<ItemDetails>("get_item_details", { sessionId, nodeId })
+            : null;
+          return {
+            title: item.title,
+            display_path: details?.item.display_path ?? null,
+            category: item.category,
+            tier: item.tier,
+            reclaimable_bytes: item.reclaimable_bytes,
+            evidence: item.evidence.length > 0 ? item.evidence : details ? [details.evidence] : [],
+            warnings: item.warnings,
+            action_kind: item.action_kind,
+          };
+        }));
+        return budget.wrap("CleanupOpportunitiesResult", {
+          items,
+          conservative_bytes: addByteStrings(plan.selected_candidate_bytes, plan.omitted_candidate_bytes),
+          review_potential_bytes: addByteStrings(plan.review_potential_bytes, plan.omitted_review_bytes),
+          total_opportunity_count: eligible.length,
+          returned_count: Math.min(eligible.length, limit),
+          source_truncated: plan.truncated,
+          ...(resolved.scope ? { resolved_scope: resolved.scope } : {}),
+          query_note: eligible.length === 0
+            ? "No deterministic cleanup opportunities matched the current policy."
+            : undefined,
+        });
       },
     }),
 
@@ -128,7 +232,14 @@ export function createAnalyzerTools(dependencies: AnalyzerToolDependencies) {
         limit: z.number().int().min(1).max(50).default(20),
       }),
       execute: async (input) => {
-        const resolved = await resolveQueryScope(sessionId, input.scope, invoke, attachment);
+        const resolved = await resolveQueryScope(
+          sessionId,
+          input.scope,
+          invoke,
+          attachment,
+          defaultScope,
+          allowRootScope,
+        );
         if (resolved.result) {
           return budget.wrap("AggregateResult", {
             buckets: [],
@@ -152,22 +263,39 @@ export function createAnalyzerTools(dependencies: AnalyzerToolDependencies) {
       },
     }),
 
-    get_item_evidence: tool({
-      description: "Get deterministic policy and ownership evidence. For the selected UI item, set use_attached_item instead of copying its internal ID.",
+    inspect_item: tool({
+      description: "Inspect one exact file or folder by path/name, or use the trusted selected UI item. Returns deterministic size, owner, attributes, and cleanup policy evidence.",
       inputSchema: z.object({
-        item_ids: z.array(z.string().min(1)).max(20).default([]),
+        scope: z.string().max(1_024).optional(),
         use_attached_item: z.boolean().default(false),
       }).refine(
-        ({ item_ids, use_attached_item }) => use_attached_item || item_ids.length > 0,
-        "Choose the attached item or provide at least one returned item ID",
+        ({ scope, use_attached_item }) => use_attached_item || Boolean(scope?.trim()),
+        "Choose the attached item or provide one file/folder path or name",
       ),
-      execute: async ({ item_ids, use_attached_item }) => {
-        const resolvedItemIds = attachedOrExplicitItemIds(item_ids, use_attached_item, attachment);
-        const details: ItemDetails[] = [];
-        for (const nodeId of resolvedItemIds) {
-          details.push(await invoke<ItemDetails>("get_item_details", { sessionId, nodeId }));
+      execute: async ({ scope, use_attached_item }) => {
+        if (use_attached_item) {
+          if (!attachment) throw new Error("No analyzer item is attached to this message");
+          const details = await invoke<ItemDetails>("get_item_details", {
+            sessionId,
+            nodeId: attachment.id,
+          });
+          return budget.wrap("OwnershipEvidenceResult", { items: [details] });
         }
-        return budget.wrap("OwnershipEvidenceResult", { items: details });
+        const resolved = await resolveItemTarget(sessionId, scope!, invoke);
+        if (resolved.result) {
+          return budget.wrap("OwnershipEvidenceResult", resolved.result);
+        }
+        const details = await invoke<ItemDetails>("get_item_details", {
+          sessionId,
+          nodeId: resolved.item!.id,
+        });
+        return budget.wrap("OwnershipEvidenceResult", {
+          items: [details],
+          resolved_item: {
+            name: details.item.name,
+            display_path: details.item.display_path,
+          },
+        });
       },
     }),
 
@@ -268,20 +396,199 @@ export function createAnalyzerTools(dependencies: AnalyzerToolDependencies) {
   };
 }
 
+async function inspectFolder(
+  dependencies: AnalyzerToolDependencies,
+  input: { scope?: string; limit: number },
+  budget: ToolResultBudget,
+): Promise<AgentToolResult<unknown>> {
+  const sessionId = dependencies.sessionId;
+  const resolved = await resolveQueryScope(
+    sessionId,
+    input.scope,
+    dependencies.invoke,
+    dependencies.attachment ?? null,
+    dependencies.defaultScope ?? null,
+    dependencies.allowRootScope ?? false,
+  );
+  if (resolved.result) {
+    return budget.wrap("FolderInspectionResult", {
+      top_children: [],
+      top_files: [],
+      kind_buckets: [],
+      policy_buckets: [],
+      extension_buckets: [],
+      scope_candidates: resolved.result.scope_candidates ?? [],
+      query_note: resolved.result.query_note,
+    });
+  }
+
+  const summary = await dependencies.invoke<ScanSummary | null>("get_scan_summary");
+  if (!summary || summary.session_id !== sessionId) {
+    throw new Error("The requested scan session is no longer active");
+  }
+  const [children, largestFiles, kindAggregate, policyAggregate, extensionAggregate, details] = await Promise.all([
+    dependencies.invoke<ItemPage>("query_items", {
+      sessionId,
+      query: {
+        parent_id: resolved.scope?.id ?? null,
+        recursive: false,
+        sort: "allocated",
+        direction: "desc",
+        cursor: null,
+        limit: input.limit,
+      } satisfies ItemQuery,
+    }),
+    dependencies.invoke<ItemPage>("query_items", {
+      sessionId,
+      query: {
+        parent_id: null,
+        recursive: true,
+        top_only: true,
+        scope_id: resolved.scope?.id,
+        kinds: ["file"],
+        sort: "allocated",
+        direction: "desc",
+        cursor: null,
+        limit: input.limit,
+      } satisfies ItemQuery,
+    }),
+    dependencies.invoke<StorageAggregate>("get_storage_aggregate", {
+      sessionId,
+      query: {
+        scope_id: resolved.scope?.id ?? null,
+        dimension: "kind",
+        limit: 10,
+      } satisfies StorageAggregateQuery,
+    }),
+    dependencies.invoke<StorageAggregate>("get_storage_aggregate", {
+      sessionId,
+      query: {
+        scope_id: resolved.scope?.id ?? null,
+        dimension: "policy",
+        limit: 10,
+      } satisfies StorageAggregateQuery,
+    }),
+    dependencies.invoke<StorageAggregate>("get_storage_aggregate", {
+      sessionId,
+      query: {
+        scope_id: resolved.scope?.id ?? null,
+        dimension: "extension",
+        limit: 10,
+      } satisfies StorageAggregateQuery,
+    }),
+    resolved.scope
+      ? dependencies.invoke<ItemDetails>("get_item_details", {
+          sessionId,
+          nodeId: resolved.scope.id,
+        })
+      : Promise.resolve(null),
+  ]);
+  const scope = details?.item ?? {
+    id: null,
+    name: summary.target.display_path,
+    display_path: summary.target.display_path,
+    kind: "directory",
+    logical_bytes: summary.logical_bytes,
+    allocated_bytes: summary.allocated_bytes,
+    policy: null,
+  };
+  return budget.wrap("FolderInspectionResult", {
+    scope,
+    top_children: children.items,
+    top_files: largestFiles.items,
+    next_cursor: children.next_cursor,
+    kind_buckets: kindAggregate.buckets,
+    policy_buckets: policyAggregate.buckets,
+    extension_buckets: extensionAggregate.buckets,
+    coverage: summary.coverage,
+    warnings: summary.warnings,
+    query_context: {
+      scope: resolved.scope?.display_path ?? summary.target.display_path,
+      sort: "allocated",
+      direction: "desc",
+      limit: input.limit,
+    },
+  });
+}
+
+export async function queryStorageItems(
+  dependencies: AnalyzerToolDependencies,
+  input: StorageItemQueryInput,
+  budget = dependencies.budget ?? new ToolResultBudget(),
+): Promise<AgentToolResult<unknown>> {
+  const sessionId = dependencies.sessionId;
+  const resolved = await resolveQueryScope(
+    sessionId,
+    input.scope,
+    dependencies.invoke,
+    dependencies.attachment ?? null,
+    dependencies.defaultScope ?? null,
+    dependencies.allowRootScope ?? false,
+  );
+  const recursive = input.recursive ?? Boolean(input.text);
+  const queryContext = {
+    scope: resolved.scope?.display_path ?? input.scope ?? null,
+    mode: input.mode ?? (input.text ? "search" : recursive ? "largest" : "children"),
+    sort: input.sort,
+    direction: input.direction,
+    kinds: input.kinds ?? [],
+    limit: input.limit,
+  };
+  if (resolved.result) {
+    return budget.wrap("ItemListResult", { ...resolved.result, query_context: queryContext });
+  }
+  const query: ItemQuery = {
+    parent_id: recursive ? null : resolved.scope?.id ?? null,
+    recursive,
+    top_only: input.topOnly,
+    scope_id: recursive ? resolved.scope?.id : undefined,
+    text: input.text,
+    kinds: input.kinds,
+    extensions: input.extensions,
+    policy_tiers: input.policy_tiers,
+    owner_ids: input.owner_ids,
+    min_bytes: input.min_bytes,
+    modified_before_ms: input.modified_before_ms,
+    sort: input.sort,
+    direction: input.direction,
+    cursor: input.cursor,
+    limit: input.limit,
+  };
+  const page = await dependencies.invoke<ItemPage>("query_items", { sessionId, query });
+  return budget.wrap(
+    "ItemListResult",
+    {
+      ...page,
+      ...(resolved.scope ? { resolved_scope: resolved.scope } : {}),
+      query_context: queryContext,
+    },
+  );
+}
+
 async function resolveQueryScope(
   sessionId: string,
   requestedScope: string | undefined,
   invoke: AnalyzerInvoke,
   attachment: AnalyzerAttachment | null,
+  defaultScope: AnalyzerQueryScope | null,
+  allowRootScope: boolean,
 ) {
   const scope = requestedScope?.trim();
   if (!scope) {
-    return attachment?.kind === "directory"
+    return defaultScope
+      ? { scope: defaultScope, result: null }
+      : attachment?.kind === "directory"
       ? { scope: attachmentScope(attachment), result: null }
       : { scope: null, result: null };
   }
   const normalizedScope = normalizePath(scope);
   if (!normalizedScope || /^[a-z]:$/i.test(normalizedScope)) {
+    if (!allowRootScope) {
+      if (defaultScope) return { scope: defaultScope, result: null };
+      if (attachment?.kind === "directory") {
+        return { scope: attachmentScope(attachment), result: null };
+      }
+    }
     return { scope: null, result: null };
   }
   if (attachment?.kind === "directory" && (
@@ -309,6 +616,7 @@ async function resolveQueryScope(
     sessionId,
     query: {
       parent_id: null,
+      recursive: true,
       scope_id: undefined,
       text: scopeSearchText(scope),
       kinds: ["directory"],
@@ -337,6 +645,51 @@ async function resolveQueryScope(
     scope: { id: match.id, name: match.name, display_path: match.display_path },
     result: null,
   };
+}
+
+async function resolveItemTarget(
+  sessionId: string,
+  requestedScope: string,
+  invoke: AnalyzerInvoke,
+) {
+  const scope = requestedScope.trim();
+  if (/:\d+$/.test(scope)) {
+    return {
+      item: null,
+      result: {
+        items: [],
+        scope_candidates: [],
+        query_note: "Provide the file or folder name/path instead of a scan-local item id.",
+      },
+    };
+  }
+  const candidates = await invoke<ItemPage>("query_items", {
+    sessionId,
+    query: {
+      parent_id: null,
+      recursive: true,
+      scope_id: undefined,
+      text: scopeSearchText(scope),
+      sort: "allocated",
+      direction: "desc",
+      cursor: null,
+      limit: 100,
+    } satisfies ItemQuery,
+  });
+  const matches = bestScopeMatches(candidates.items, scope);
+  if (matches.length !== 1) {
+    return {
+      item: null,
+      result: {
+        items: [],
+        scope_candidates: matches.slice(0, 10),
+        query_note: matches.length === 0
+          ? `No file or folder matched ${JSON.stringify(scope)}.`
+          : `Multiple items matched ${JSON.stringify(scope)}. Use one returned display_path.`,
+      },
+    };
+  }
+  return { item: matches[0], result: null };
 }
 
 function attachmentScope(attachment: AnalyzerAttachment) {
@@ -374,6 +727,14 @@ function bestScopeMatches(items: ItemPage["items"], scope: string) {
 
 function normalizePath(value: string) {
   return value.trim().replaceAll("/", "\\").replace(/\\+$/, "").toLocaleLowerCase();
+}
+
+function addByteStrings(left: string, right: string) {
+  try {
+    return (BigInt(left) + BigInt(right)).toString();
+  } catch {
+    return left;
+  }
 }
 
 function fitResult<T>(
@@ -467,7 +828,7 @@ export function countToolResultItems(result: unknown): number | null {
   if (!result || typeof result !== "object") return null;
   const data = (result as { data?: unknown }).data;
   if (data && typeof data === "object") {
-    for (const key of ["items", "buckets", "scenarios"]) {
+    for (const key of ["items", "top_children", "buckets", "scenarios"]) {
       const value = (data as Record<string, unknown>)[key];
       if (Array.isArray(value)) return value.length;
     }

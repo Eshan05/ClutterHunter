@@ -19,6 +19,8 @@ import {
   X,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Streamdown, type Components } from "streamdown";
+import "streamdown/styles.css";
 import type { CleanupPlan } from "./bindings/CleanupPlan";
 import type { ItemRow } from "./bindings/ItemRow";
 import type { ScanSummary } from "./bindings/ScanSummary";
@@ -44,6 +46,11 @@ import {
 
 type DockTab = "chat" | "plan";
 type MessageStatus = "streaming" | "complete" | "cancelled" | "error";
+
+const assistantMarkdownComponents: Components = {
+  a: ({ children }) => <span className="markdown-link-label">{children}</span>,
+  img: ({ alt }) => <span className="markdown-image-blocked">{alt ? `[Image omitted: ${alt}]` : "[Image omitted]"}</span>,
+};
 
 interface ChatMessage {
   id: string;
@@ -99,6 +106,9 @@ export function AgentDock({
   const [approvals, setApprovals] = useState<PendingAgentApproval[]>([]);
   const [approvalDecisions, setApprovalDecisions] = useState<Record<string, boolean>>({});
   const [plan, setPlan] = useState<CleanupPlan | null>(null);
+  const [planTargetGb, setPlanTargetGb] = useState("");
+  const [planBuilding, setPlanBuilding] = useState(false);
+  const [planError, setPlanError] = useState<string | null>(null);
   const [prompt, setPrompt] = useState("");
   const [running, setRunning] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -166,7 +176,6 @@ export function AgentDock({
     setActivities([]);
     setApprovals([]);
     setApprovalDecisions({});
-    setPlan(null);
     setError(null);
     sessionRef.current = runtime && preparedModel && summary
       ? runtime.createSession({
@@ -177,6 +186,13 @@ export function AgentDock({
       })
       : null;
   }, [preparedModel, runtime, summary, updateActivity, workflow]);
+
+  useEffect(() => {
+    setPlan(null);
+    setPlanTargetGb("");
+    setPlanBuilding(false);
+    setPlanError(null);
+  }, [summary?.session_id]);
 
   useEffect(() => {
     sessionRef.current?.setAttachment(attachment ? toAnalyzerAttachment(attachment) : null);
@@ -227,7 +243,10 @@ export function AgentDock({
     setActivities(result.activities);
     setApprovals(result.approvals);
     setApprovalDecisions({});
-    if (result.plan) setPlan(result.plan);
+    if (result.plan) {
+      setPlan(result.plan);
+      setPlanError(null);
+    }
   };
 
   const sendPrompt = async () => {
@@ -338,8 +357,8 @@ export function AgentDock({
   };
 
   const togglePlanItem = async (itemId: string, selected: boolean) => {
-    if (!summary || running) return;
-    setError(null);
+    if (!summary || running || planBuilding) return;
+    setPlanError(null);
     try {
       const nextPlan = await invoke<CleanupPlan>("edit_cleanup_plan", {
         sessionId: summary.session_id,
@@ -347,7 +366,29 @@ export function AgentDock({
       });
       setPlan(nextPlan);
     } catch (nextError) {
-      setError(agentErrorMessage(nextError));
+      setPlanError(agentErrorMessage(nextError));
+    }
+  };
+
+  const buildDeterministicPlan = async () => {
+    if (!summary || running || planBuilding) return;
+    const targetBytes = gibibytesToBytes(planTargetGb);
+    if (planTargetGb.trim() && targetBytes === null) {
+      setPlanError("Enter a positive cleanup target in GB.");
+      return;
+    }
+    setPlanBuilding(true);
+    setPlanError(null);
+    try {
+      const nextPlan = await invoke<CleanupPlan>("build_cleanup_plan", {
+        sessionId: summary.session_id,
+        request: { target_bytes: targetBytes },
+      });
+      setPlan(nextPlan);
+    } catch (nextError) {
+      setPlanError(agentErrorMessage(nextError));
+    } finally {
+      setPlanBuilding(false);
     }
   };
 
@@ -440,7 +481,19 @@ export function AgentDock({
               <div key={message.id} className={`chat-message message-${message.role} message-${message.status}`}>
                 <span>{message.role === "assistant" ? <Bot size={13} /> : "You"}</span>
                 <div className="message-body">
-                  <p>{message.text || <LoaderCircle className="spin" size={14} />}</p>
+                  {message.role === "assistant" ? message.text ? (
+                    <Streamdown
+                      animated
+                      className="message-markdown"
+                      components={assistantMarkdownComponents}
+                      isAnimating={message.status === "streaming"}
+                      lineNumbers={false}
+                      mode={message.status === "streaming" ? "streaming" : "static"}
+                    >
+                      {message.text}
+                    </Streamdown>
+                  ) : <div className="message-loading"><LoaderCircle className="spin" size={14} /></div>
+                    : <p>{message.text}</p>}
                   {message.results.length > 0 && (
                     <div className="tool-result-list">
                       {message.results.map((result, index) => (
@@ -507,18 +560,39 @@ export function AgentDock({
         </div>
       ) : (
         <div className="dock-content plan-content">
+          <div className="plan-controls">
+            <label className="plan-target">
+              <input
+                type="text"
+                inputMode="decimal"
+                aria-label="Cleanup target in GB"
+                placeholder="Target"
+                value={planTargetGb}
+                disabled={!summary || running || planBuilding}
+                onChange={(event) => setPlanTargetGb(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter") void buildDeterministicPlan();
+                }}
+              />
+              <span>GB</span>
+            </label>
+            <button type="button" disabled={!summary || running || planBuilding} onClick={() => void buildDeterministicPlan()}>
+              {planBuilding ? <LoaderCircle className="spin" size={14} /> : <FolderSearch size={14} />}
+              Find cleanup
+            </button>
+          </div>
           <div className="plan-totals">
             <div><span>Conservative</span><strong>{formatBytes(plan?.selected_candidate_bytes ?? "0")}</strong></div>
             <div><span>Review potential</span><strong>{formatBytes(plan?.review_potential_bytes ?? "0")}</strong></div>
           </div>
           <div className="plan-list">
             {!plan ? (
-              <div className="plan-empty"><ShieldCheck size={24} /><strong>No cleanup plan</strong><span>Use Plan cleanup workflow in Chat</span></div>
+              <div className="plan-empty"><ShieldCheck size={24} /><strong>No cleanup plan</strong><span>No proposal for this scan</span></div>
             ) : plan.items.length === 0 ? (
               <div className="plan-empty"><ShieldCheck size={24} /><strong>No eligible items</strong><span>Deterministic planner returned no candidates</span></div>
             ) : plan.items.map((item) => (
               <label className="plan-row" key={item.id}>
-                <input type="checkbox" checked={item.selected} disabled={running} onChange={(event) => void togglePlanItem(item.id, event.target.checked)} />
+                <input type="checkbox" checked={item.selected} disabled={running || planBuilding} onChange={(event) => void togglePlanItem(item.id, event.target.checked)} />
                 <span className="plan-row-copy">
                   <strong>{item.title}</strong>
                   <small>{item.category} · {formatBytes(item.reclaimable_bytes)} · {item.tier.replace("_", " ")}</small>
@@ -527,7 +601,7 @@ export function AgentDock({
               </label>
             ))}
           </div>
-          {error && <div className="agent-error plan-error" role="alert"><CircleAlert size={14} /><span>{error}</span></div>}
+          {planError && <div className="agent-error plan-error" role="alert"><CircleAlert size={14} /><span>{planError}</span></div>}
         </div>
       )}
     </aside>
@@ -582,6 +656,8 @@ function ToolResultCard({ result }: { result: AgentToolResult<unknown> }) {
 function resultCardConfig(component: AgentToolResult<unknown>["component"]) {
   if (component === "StorageOverviewResult") return { label: "Scan overview", icon: Database };
   if (component === "ItemListResult") return { label: "Storage items", icon: FolderSearch };
+  if (component === "FolderInspectionResult") return { label: "Folder inspection", icon: FolderSearch };
+  if (component === "CleanupOpportunitiesResult") return { label: "Cleanup opportunities", icon: ShieldCheck };
   if (component === "AggregateResult") return { label: "Storage groups", icon: BarChart3 };
   if (component === "OwnershipEvidenceResult") return { label: "Item evidence", icon: ShieldCheck };
   if (component === "LogExcerptApproval") return { label: "Approved log excerpt", icon: FileText };
@@ -600,11 +676,52 @@ function resultRows(component: AgentToolResult<unknown>["component"], data: Reco
   }
   if (component === "ItemListResult") {
     const items = Array.isArray(data.items) ? data.items.slice(0, 8) : [];
+    const queryContext = asRecord(data.query_context);
+    const sizeField = queryContext.sort === "logical" ? "logical_bytes" : "allocated_bytes";
     return items.flatMap((item) => {
       const record = asRecord(item);
       const name = stringField(record, "name", "Unnamed item");
-      return [resultRow(name, stringField(record, "allocated_bytes", "0"), true, stringField(record, "display_path", name))];
+      return [resultRow(name, stringField(record, sizeField, "0"), true, stringField(record, "display_path", name))];
     });
+  }
+  if (component === "FolderInspectionResult") {
+    const scope = asRecord(data.scope);
+    const children = Array.isArray(data.top_children) ? data.top_children.slice(0, 4) : [];
+    const files = Array.isArray(data.top_files) ? data.top_files.slice(0, 4) : [];
+    const extensions = Array.isArray(data.extension_buckets) ? data.extension_buckets.slice(0, 3) : [];
+    const scopePath = stringField(scope, "display_path", "Selected folder");
+    return [
+      resultRow(scopePath, stringField(scope, "allocated_bytes", "0"), true, scopePath),
+      ...children.map((item) => {
+        const record = asRecord(item);
+        const name = stringField(record, "name", "Unnamed item");
+        return resultRow(`Child · ${name}`, stringField(record, "allocated_bytes", "0"), true, stringField(record, "display_path", name));
+      }),
+      ...files.map((item) => {
+        const record = asRecord(item);
+        const name = stringField(record, "name", "Unnamed file");
+        return resultRow(`File · ${name}`, stringField(record, "allocated_bytes", "0"), true, stringField(record, "display_path", name));
+      }),
+      ...extensions.map((bucket) => {
+        const record = asRecord(bucket);
+        return resultRow(`Type · ${stringField(record, "label", "Other")}`, stringField(record, "allocated_bytes", "0"), true);
+      }),
+    ];
+  }
+  if (component === "CleanupOpportunitiesResult") {
+    const items = Array.isArray(data.items) ? data.items.slice(0, 6) : [];
+    return [
+      resultRow("Conservative", stringField(data, "conservative_bytes", "0"), true),
+      resultRow("Review potential", stringField(data, "review_potential_bytes", "0"), true),
+      ...items.map((item) => {
+        const record = asRecord(item);
+        const title = stringField(record, "title", "Cleanup opportunity");
+        const path = stringField(record, "display_path", title);
+        const tier = stringField(record, "tier", "review_required").replaceAll("_", " ");
+        const action = stringField(record, "action_kind", "none").replaceAll("_", " ");
+        return resultRow(`${path} · ${tier}`, stringField(record, "reclaimable_bytes", "0"), true, action === "none" ? title : `${title} · ${action}`);
+      }),
+    ];
   }
   if (component === "AggregateResult") {
     const buckets = Array.isArray(data.buckets) ? data.buckets.slice(0, 8) : [];
@@ -614,11 +731,17 @@ function resultRows(component: AgentToolResult<unknown>["component"], data: Reco
     });
   }
   if (component === "OwnershipEvidenceResult") {
-    const items = Array.isArray(data.items) ? data.items.slice(0, 8) : [];
-    return items.map((details) => {
+    const items = Array.isArray(data.items) ? data.items.slice(0, 3) : [];
+    return items.flatMap((details) => {
       const item = asRecord(asRecord(details).item);
       const evidence = asRecord(asRecord(details).evidence);
-      return resultRow(stringField(item, "name", "Item"), stringField(evidence, "tier", "unknown").replaceAll("_", " "), false, stringField(item, "display_path", "Item"));
+      const owner = asRecord(item.owner);
+      const path = stringField(item, "display_path", stringField(item, "name", "Item"));
+      return [
+        resultRow(path, stringField(item, "allocated_bytes", "0"), true, path),
+        resultRow("Owner", stringField(owner, "name", "Unknown")),
+        resultRow("Policy", stringField(evidence, "tier", "unknown").replaceAll("_", " ")),
+      ];
     });
   }
   if (component === "LogExcerptApproval") {
@@ -640,6 +763,18 @@ function resultRows(component: AgentToolResult<unknown>["component"], data: Reco
 
 function resultRow(label: string, value: string, bytes = false, title?: string) {
   return { label, value: bytes ? formatBytes(value) : value, title };
+}
+
+function gibibytesToBytes(value: string): string | null {
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  const match = /^(\d+)(?:\.(\d{1,3}))?$/.exec(trimmed);
+  if (!match) return null;
+  const whole = BigInt(match[1] ?? "0");
+  const fraction = BigInt((match[2] ?? "").padEnd(3, "0"));
+  const milliGibibytes = whole * 1000n + fraction;
+  if (milliGibibytes === 0n) return null;
+  return ((milliGibibytes * 1024n * 1024n * 1024n) / 1000n).toString();
 }
 
 function asRecord(value: unknown): Record<string, unknown> {

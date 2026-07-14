@@ -1,6 +1,6 @@
 # Local Agent Notes
 
-Status: implementation-order item 4 complete; packaged-window acceptance recorded separately  
+Status: item 4 architecture complete; real-scan answer-quality acceptance open
 Last updated: 2026-07-15
 
 This file records implementation evidence for implementation-order item 4. The
@@ -29,12 +29,14 @@ durable privacy, tool, and model contracts remain in
 - A versioned four-scenario streaming harness tests overview plus named-folder
   scope/query, conservative versus review plan totals, empty-result honesty, and
   one bounded retry. Results cache by model digest, Ollama version, and harness
-  version. Harness v5 uses the native
+  version. Harness v6 uses the native
   production stream, records median first-token latency, accepts the same typed
   deterministic presentation used when a small model finishes a valid tool call
   without prose, and invalidates earlier
   OpenAI-compatible/non-streaming cache entries. A
-  failed model cannot create a real agent session.
+  failed model cannot create a real agent session. Native requests set
+  `think: false`; this avoids spending the small-model latency budget on hidden
+  reasoning and bumped the harness version to invalidate older cached passes.
 - The bundled offline catalog and deterministic ranker cover Light, Balanced,
   and Heavy candidates. Rust exposes physical/available memory through a bounded
   `get_hardware_profile` command for fit calculations; model choice remains
@@ -47,9 +49,13 @@ The session exposes three `activeTools` workflows: investigation, plan, and
 policy. Current tools are:
 
 - `get_storage_overview`
-- `query_storage_items`
+- `list_folder_children`
+- `list_largest_items`
+- `search_storage`
+- `inspect_folder`
+- `list_cleanup_opportunities`
 - `summarize_storage`
-- `get_item_evidence`
+- `inspect_item`
 - `inspect_log_excerpt`
 - `build_cleanup_plan`
 - `edit_cleanup_plan`
@@ -61,10 +67,26 @@ capped at 12 KiB and each turn at 32 KiB with explicit truncation. Turns stop at
 eight model steps, allow one invalid-call repair, target one to three tools, cap
 output at 1,024 tokens, and enforce 60-second step/180-second total timeouts.
 
-The model-facing item query and aggregate tools accept a folder name/path as
+The model-facing list, search, inspection, and aggregate tools accept a folder name/path as
 `scope`; each resolves it against bounded analyzer results and performs the
 scoped operation in one execution. Opaque scan-local node IDs remain an internal
 implementation detail rather than a value small models must copy between calls.
+`list_folder_children` always returns only the resolved folder's immediate
+children. `search_storage` requires non-empty text and explicitly selects
+recursive traversal bounded to the resolved subtree. `list_largest_items` is the
+separate recursive top-N path for largest files/items without search text. Rust
+carries recursion as an explicit flag and uses `top_only` to retain at most the
+requested 100 ranked nodes instead of sorting every descendant.
+
+`inspect_folder` composes exact folder totals, largest immediate children, largest
+files at any depth, top extensions, kind/policy aggregates, coverage, and warnings
+into one bounded result. `list_cleanup_opportunities` can resolve one folder and
+reads a scoped deterministic policy/planner result without creating or replacing
+the current Plan; conservative and review-potential totals remain separate.
+Read-only opportunity rows expose exact display paths, reasons, safety tier,
+proposed action, and bytes while omitting scan-local node IDs.
+`inspect_item` resolves one exact file/folder path or name, or consumes the trusted
+UI attachment, then returns deterministic size, ownership, attributes, and policy.
 An attached directory becomes the default scope, while `/` explicitly means the
 scan root. A matching attached name or full path resolves directly to trusted UI
 metadata; other full paths search by final component and require an exact returned
@@ -73,6 +95,14 @@ to the model deliberately omits the node ID.
 If a local model completes a tool call without prose, the runtime renders a
 bounded, deterministic answer from that tool result instead of showing an empty
 response.
+
+Common ranked list intents, explicit `top N`, and same-scope `all` follow-ups use
+a deterministic front-controller. Largest folders stay immediate-child queries;
+largest files use bounded recursive top-N ranking. It extracts kind, metric,
+direction, limit, and optional named/path scope before invoking Rust directly.
+The language model is not a correctness dependency for these frequent facts. Other factual prompts
+still force an evidence tool; if the model skips it, generated paths and sizes
+are discarded and a visible tool diagnostic is returned.
 
 Only recent user/assistant text is retained, bounded to 12 messages and 24,000
 characters. Older local conversation text is reduced into a deterministic
@@ -103,8 +133,15 @@ reparse points, and returns bounded beginning/end excerpts. Limits are five file
 - The dock offers explicit Investigate, Plan cleanup, and Protect paths workflows.
   A prepared model binds only to the current analyzer session; rescan, target,
   model, or workflow changes discard stale conversation and plan state.
-- Assistant text streams through AI SDK 7. Tool activity shows purpose, state,
-  result count, elapsed time, and truncation without exposing raw thinking.
+- Assistant prose streams through AI SDK 7 and renders with Streamdown. Remote
+  images and generated links are inert so Markdown cannot bypass local privacy.
+  Tool activity shows purpose, state, result count, elapsed time, and truncation
+  without exposing raw thinking.
+- Factual prompts are routed to a required first evidence tool. Item, aggregate,
+  and overview values are formatted from deterministic envelopes rather than
+  model prose. Query context echoes scope, metric, direction, kinds, and limit.
+- The last exact resolved scope survives ambiguous follow-ups. A model-invented
+  root scope is rejected unless the user explicitly asks for the scan/drive root.
 - Cancellation aborts the active stream. Cancelling an approval continuation also
   clears pending conversation context to prevent an approved action from being
   replayed accidentally.
@@ -131,15 +168,17 @@ aggregation is also not advertised until the analyzer supplies native age bucket
 ## Verification
 
 - TypeScript 7 production build passes.
-- Thirty-nine enabled Vitest tests cover endpoint isolation, redirect denial, local metadata,
+- Sixty-two enabled Vitest tests cover endpoint isolation, redirect denial, local metadata,
   cloud-response rejection, service-unavailable behavior, catalog ranking,
   harness caching, Tauri command mapping, approval declaration, and tool budgets,
   including attached-scope/full-path resolution, trusted attachment evidence, root
-  selection, and bounded preservation of a single large approved log excerpt. Nine
+  selection, grounded routing, scope retention, and bounded preservation of a
+  single large approved log excerpt. Fourteen
   jsdom/Testing Library cases cover Ollama failure, low-memory warning/override,
-  streaming chat plus Plan handoff, typed cards, analyzer attachment, exact-path
-  approval, and cancellation.
-- All 111 enabled Rust workspace tests pass (seven platform/helper tests remain
+  Streamdown rendering, streaming chat plus Plan handoff, typed cards, analyzer
+  attachment, exact-path approval, cancellation, and deterministic offline Plan
+  creation/editing.
+- All 114 enabled Rust workspace tests pass (seven platform/helper tests remain
   intentionally ignored), and warning-denied workspace clippy is clean.
 - The production Tauri release, MSI, and NSIS builds pass with scanner protocol
   v10 and the loopback-scoped HTTP plugin enabled. The staged and MSI-extracted
@@ -149,25 +188,36 @@ aggregation is also not advertised until the analyzer supplies native age bucket
   0.30.7 discovery, current-memory reporting, scan-session gating, and cancellation
   while the analyzer remained usable.
 - The local `granite4:1b-h` digest `7761ae79cab9...` passed all four native
-  streaming harness v5 scenarios with Ollama `0.30.7`, including the generic
+  streaming harness v7 scenarios with Ollama `0.30.7`, including the generic
   `Projects` named-scope contract. The complete live runtime suite then passed
-  scoped query, selected-directory default scope, trusted attachment evidence,
-  plan handoff, approval denial, and approved exact-path execution in 46.7 seconds.
+  forced scoped query, same-scope follow-up, selected-directory default scope,
+  invented-root rejection, bounded recursive top-N ranking, trusted attachment
+  and path-addressed item evidence, composite folder inspection, scoped cleanup
+  opportunities, plan handoff, approval denial, and approved exact-path execution
+  in 53.1 seconds.
 - The retry isolated an Ollama compatibility issue rather than an inference
   problem: warmed native `/api/chat` streamed its first LFM token in about 350 ms,
   while `/v1/chat/completions` returned no headers within 35 seconds. Moving the
   AI SDK transport to the native provider fixed Granite immediately.
+- `functiongemma:latest` failed three full-agent harness scenarios and scored
+  0/4 in a separate fair single-call router test, choosing wrong tools, producing
+  no valid scoped call, or dropping required arguments. Stock FunctionGemma is
+  not used in a compound runtime; a domain fine-tune remains an experiment.
 - `lfm2.5-thinking:latest` streams natively but emitted only thinking and no tool
-  calls in the harness, so that digest remains ineligible. `qwen3.5:2b` could not
-  load under the available system-memory pressure. The ranker incorporates
-  currently available memory rather than treating total RAM alone as a fit.
+  calls in the harness, so that digest remains ineligible. `qwen3.5:2b` loaded
+  after memory pressure eased, but even with `think: false` its overview scenario
+  exceeded the 20-second step limit; the rejected run took 80.6 seconds. The
+  ranker incorporates available memory rather than treating total RAM alone as
+  a fit.
 
 ## Acceptance Boundary
 
-Implementation-order item 4 is complete: local discovery/ranking, hardware fit,
+Implementation-order item 4 architecture is complete: local discovery/ranking, hardware fit,
 native preflight, harness gating, bounded agent tools, typed presentation,
 session context, approvals, cancellation, and deterministic Plan refinement are
-implemented and automated. The accepted demo choice on the prepared 8 GB machine
+implemented and automated. Final quality acceptance remains open until the exact
+reported path/follow-up prompts pass against the user's real MFT scan in Tauri.
+The current demo choice on the prepared 8 GB machine
 is the passing Granite light fallback; Qwen 3.5 2B remains rejected after its
 overview step exceeded the harness timeout under current memory pressure.
 Packaged-window repetition and Playwright expansion are implementation-order item

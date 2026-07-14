@@ -545,6 +545,21 @@ pub fn build_cleanup_plan(
 }
 
 #[tauri::command]
+pub fn get_cleanup_opportunities(
+    session_id: String,
+    scope_id: Option<String>,
+    state: State<'_, ScannerState>,
+) -> Result<CleanupPlan, ScanFailure> {
+    let output = completed_output(&state, &session_id)?;
+    let output = output.read().map_err(|_| internal_state_failure())?;
+    output.analyzer.build_plan_in_scope(
+        &output.arena,
+        &CleanupPlanRequest { target_bytes: None },
+        scope_id.as_deref(),
+    )
+}
+
+#[tauri::command]
 pub fn edit_cleanup_plan(
     session_id: String,
     edit: PlanEdit,

@@ -422,28 +422,35 @@ HarnessResult {
 }
 ```
 
-Tauri commands:
+Implemented Tauri commands:
 
 ```text
 list_scan_targets
+get_hardware_profile
 start_scan
 cancel_scan
 get_scan_summary
 query_items
 cancel_item_query
 get_item_details
+inspect_log_excerpt
 get_storage_aggregate
 get_treemap_slice
+get_cleanup_opportunities
 build_cleanup_plan
 edit_cleanup_plan
 set_path_protection
 dismiss_suggestion
+```
+
+Deferred command surface, not registered in the current application:
+
+```text
 list_model_profiles
 save_model_selection
 start_duplicate_analysis
 cancel_duplicate_analysis
 get_duplicate_results
-read_log_excerpt
 open_item_location
 ```
 
@@ -703,9 +710,13 @@ tools it needs.
 
 ```text
 get_storage_overview()
-query_storage_items(scope?, text?, filters?, sort?, cursor?, limit <= 100)
+list_folder_children(scope?, filters?, sort?, cursor?, limit <= 100)
+list_largest_items(scope?, kinds?, extensions?, policy_tiers?, min_bytes?, modified_before?, metric, limit <= 100)
+search_storage(scope?, text, filters?, sort?, cursor?, limit <= 100)
+inspect_folder(scope?, limit <= 25)
+list_cleanup_opportunities(scope?, include_review?, limit <= 50)
 summarize_storage(scope?, group_by: extension | owner | policy | kind, limit <= 50)
-get_item_evidence(item_ids <= 20 | use_attached_item)
+inspect_item(scope | use_attached_item)
 build_cleanup_plan(target_bytes?, constraints?)
 edit_cleanup_plan(add_item_ids?, remove_item_ids?)
 get_duplicate_results(scope_id?, cursor?, limit <= 50)
@@ -716,9 +727,24 @@ protect_path(item_id | use_attached_item, reason?)
 Behavior:
 
 - Read-only metadata tools run automatically and appear in the activity trace.
-- A selected directory is the default query/aggregate scope. `/` explicitly
+- A selected directory is the default list/search/inspect/aggregate scope. `/` explicitly
   selects the scan root. Full paths resolve locally by final component and exact
   returned path; the selected item's internal node ID is never shown to the model.
+- Folder listing is always immediate-child navigation. Recursive traversal is
+  exposed only through explicit `search_storage` name/path search or bounded
+  `list_largest_items` ranking.
+- `list_largest_items` performs a bounded top-N recursive size ranking without
+  retaining or sorting every matching node. It is distinct from navigation and
+  name/path search.
+- `inspect_folder` composes exact totals, largest immediate children, kind/policy
+  aggregates, largest files at any depth, top extensions, coverage, and warnings
+  into one bounded result. The model does not reconstruct this view from prose.
+- `list_cleanup_opportunities` reads deterministic planner/policy output without
+  creating or replacing the user's current Plan and can be bounded to one locally
+  resolved folder. Returned rows include exact display path, policy evidence,
+  action kind, and reclaimable bytes but omit scan-local IDs.
+- `inspect_item` resolves one exact path/name locally or uses the trusted UI
+  attachment, then returns size, ownership, attributes, and policy evidence.
 - Evidence and approval tools consume the trusted UI attachment through
   `use_attached_item`; model-copied attachment IDs are not trusted.
 - Plan edits are session-only, visible, and reversible.
@@ -998,9 +1024,10 @@ Generate a smaller fast UI fixture separately for ordinary automated tests.
 ## 19. Implementation Sequence
 
 Status on 2026-07-15: Phase 0 (implementation-order item 1), Phase 1 (item 2),
-and Phase 3 (item 4) meet their implementation exits. Phase 2 remains the next
-product build focus. Controlled cold-cache/WizTree repetition, installed security
-recording, expanded Playwright, and visual polish remain Phase 4/item 5 work.
+Phase 2 (item 3), and Phase 3 (item 4) meet their implementation exits. Native
+completed-scan acceptance, controlled cold-cache/WizTree repetition, installed
+security recording, expanded Playwright, and final visual polish remain Phase 4/
+item 5 work.
 
 ### Phase 0: Documentation and Skeleton
 

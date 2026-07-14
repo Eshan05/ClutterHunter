@@ -163,6 +163,11 @@ pub enum SortDirection {
 pub struct ItemQuery {
     pub parent_id: Option<String>,
     #[serde(default)]
+    pub recursive: bool,
+    #[serde(default)]
+    #[ts(optional)]
+    pub top_only: Option<bool>,
+    #[serde(default)]
     #[ts(optional)]
     pub scope_id: Option<String>,
     #[serde(default)]
@@ -199,6 +204,8 @@ impl Default for ItemQuery {
     fn default() -> Self {
         Self {
             parent_id: None,
+            recursive: false,
+            top_only: None,
             scope_id: None,
             text: None,
             kinds: None,

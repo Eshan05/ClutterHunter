@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import {
   ArrowDown,
@@ -8,9 +9,11 @@ import {
   ChevronRight,
   CircleGauge,
   Columns3,
+  Copy,
   Database,
   File,
   Folder,
+  FolderOpen,
   HardDrive,
   Link2,
   LoaderCircle,
@@ -104,6 +107,7 @@ export function AnalyzerWorkspace({
 
   const makeQuery = useCallback((cursor: string | null, queryId: string): ItemQuery => ({
     parent_id: searchText ? null : scope.id,
+    recursive: Boolean(searchText),
     scope_id: searchText && scope.id ? scope.id : undefined,
     text: searchText || undefined,
     query_id: queryId,
@@ -247,6 +251,24 @@ export function AnalyzerWorkspace({
       setDirection(nextSort === "name" ? "asc" : "desc");
     }
   };
+
+  const copySelectedPath = async () => {
+    if (!selectedItem) return;
+    try {
+      await navigator.clipboard.writeText(selectedItem.display_path);
+    } catch (error) {
+      setViewError(failureDetail(error));
+    }
+  };
+
+  const revealSelectedItem = async () => {
+    if (!selectedItem) return;
+    try {
+      await revealItemInDir(selectedItem.display_path);
+    } catch (error) {
+      setViewError(failureDetail(error));
+    }
+  };
   const scopeBytes = metric === "allocated" ? scope.allocatedBytes : scope.logicalBytes;
   const noRows = !loading && items.length === 0;
 
@@ -267,6 +289,12 @@ export function AnalyzerWorkspace({
             </span>
           ))}
         </nav>
+        {selectedItem && (
+          <div className="selection-actions" aria-label="Selected item actions">
+            <button type="button" title="Copy path" aria-label="Copy selected path" onClick={() => void copySelectedPath()}><Copy size={14} /></button>
+            <button type="button" title="Reveal in Explorer" aria-label="Reveal selected item in Explorer" onClick={() => void revealSelectedItem()}><FolderOpen size={14} /></button>
+          </div>
+        )}
         <label className="search-control">
           <Search size={15} />
           <input aria-label="Search storage items" placeholder={`Search in ${scope.name}`} value={searchInput} onChange={(event) => setSearchInput(event.target.value)} />

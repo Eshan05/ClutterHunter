@@ -18,6 +18,7 @@ pub fn run() {
             commands::inspect_log_excerpt,
             commands::get_storage_aggregate,
             commands::get_treemap_slice,
+            commands::get_cleanup_opportunities,
             commands::build_cleanup_plan,
             commands::edit_cleanup_plan,
             commands::set_path_protection,

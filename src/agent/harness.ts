@@ -4,7 +4,7 @@ import { z } from "zod";
 import type { AgentFetch } from "./endpoint";
 import type { HarnessScenarioResult, LocalModelPreflight, ModelHarnessResult, OllamaEndpoint } from "./types";
 
-export const MODEL_HARNESS_VERSION = 5;
+export const MODEL_HARNESS_VERSION = 7;
 
 type HarnessTool = ReturnType<typeof tool<any, any, any>>;
 
@@ -25,7 +25,7 @@ export async function runCompatibilityHarness(
     baseURL: endpoint.origin,
     fetch,
   });
-  const model = provider(preflight.model.name);
+  const model = provider(preflight.model.name, { think: false });
   const started = performance.now();
   const scenarios: HarnessScenarioResult[] = [];
 
@@ -38,8 +38,8 @@ export async function runCompatibilityHarness(
         inputSchema: z.object({}),
         execute: async () => ({ allocated_bytes: "10000000000", entry_count: "7", coverage: "complete" }),
       }),
-      query_storage_items: tool({
-        description: "Return synthetic large storage items inside a named folder scope.",
+      list_folder_children: tool({
+        description: "Return synthetic immediate children inside a named folder scope.",
         inputSchema: z.object({
           scope: z.string().describe("Folder name or path to query inside."),
           limit: z.number().int().min(1).max(10),
@@ -50,8 +50,8 @@ export async function runCompatibilityHarness(
         },
       }),
     },
-    "Call get_storage_overview, then query_storage_items inside the Projects folder with limit 5. Explain the largest item using only returned facts.",
-    ["get_storage_overview", "query_storage_items"],
+    "Call get_storage_overview, then list_folder_children inside the Projects folder with limit 5. Explain the largest item using only returned facts.",
+    ["get_storage_overview", "list_folder_children"],
     (text) => /video\.iso|4000000000|4\s*gb/i.test(text),
     signal,
   ));
@@ -84,14 +84,14 @@ export async function runCompatibilityHarness(
     "empty-result",
     model,
     {
-      query_storage_items: tool({
+      search_storage: tool({
         description: "Return an empty synthetic query result.",
         inputSchema: z.object({ text: z.string(), limit: z.number().int().min(1).max(10) }),
         execute: async () => ({ items: [], next_cursor: null }),
       }),
     },
-    "Search for never-present using query_storage_items with limit 5. State that no matching item was returned and invent nothing.",
-    ["query_storage_items"],
+    "Search for never-present using search_storage with limit 5. State that no matching item was returned and invent nothing.",
+    ["search_storage"],
     (text) => /no |none|empty|not (?:found|returned)/i.test(text) && !/[a-z]:\\/i.test(text),
     signal,
   ));
@@ -101,7 +101,7 @@ export async function runCompatibilityHarness(
     "bounded-retry",
     model,
     {
-      query_storage_items: tool({
+      list_folder_children: tool({
         description: "Return synthetic items. If the tool reports a transient constraint, retry once with limit 2.",
         inputSchema: z.object({ limit: z.number().int().min(1).max(2) }),
         execute: async ({ limit }) => {
@@ -113,8 +113,8 @@ export async function runCompatibilityHarness(
         },
       }),
     },
-    "Call query_storage_items with limit 2. If the tool reports a constraint, retry once, then report the returned item.",
-    ["query_storage_items", "query_storage_items"],
+    "Call list_folder_children with limit 2. If the tool reports a constraint, retry once, then report the returned item.",
+    ["list_folder_children", "list_folder_children"],
     (text) => /retry\.log/i.test(text),
     signal,
   ));

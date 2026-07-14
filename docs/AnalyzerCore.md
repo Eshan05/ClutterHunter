@@ -1,7 +1,7 @@
 # Analyzer Core Notes
 
-Status: Rust analyzer and proposal-only policy/planner verified; UI integration pending  
-Last updated: 2026-07-14
+Status: bounded analyzer UI and proposal-only policy/planner integrated; native completed-scan visual acceptance open
+Last updated: 2026-07-15
 
 This file records the implemented Phase 2 Rust boundary. The durable product and
 safety contract remains [ProductPlan.md](ProductPlan.md).
@@ -14,11 +14,14 @@ paths. The Tauri webview receives bounded DTOs rather than the arena.
 
 Implemented commands:
 
-- `query_items`: direct children or recursive scoped search with kind, extension,
+- `query_items`: explicit direct children or recursive scoped search with kind, extension,
   policy, owner, minimum allocation, and modified-time filters; seven stable sort
   modes; query-fingerprinted scan-local cursors; maximum 100 rows. Optional
   `query_id` values support explicit `cancel_item_query` calls, and a new scan
-  cancels every outstanding query.
+  cancels every outstanding query. Recursion is an explicit query flag rather
+  than an accidental side effect of adding filters. Agent top-N queries set
+  `top_only`, which keeps a bounded heap of at most 100 matching descendants
+  instead of allocating and sorting the full recursive result set.
 - `get_item_details`: the row plus deterministic policy evidence.
 - `get_storage_aggregate`: bounded extension, owner, policy, or kind buckets with
   explicit `Other` totals.
@@ -28,6 +31,8 @@ Implemented commands:
   separate candidate/review totals, target shortfall, edit-time node/tier
   revalidation, and a hard 500-item output limit with explicit omitted counts and
   byte totals.
+- `get_cleanup_opportunities`: the same deterministic planner can be scoped to one
+  analyzer folder without mutating the session's active cleanup Plan.
 - `set_path_protection` and `dismiss_suggestion`: current-session reclassification
   plus durable local settings in
   `%LOCALAPPDATA%\ClutterHunter\policy-settings.json`. Protection identities use
@@ -36,6 +41,32 @@ Implemented commands:
 
 All byte counts remain decimal strings across IPC. Generated `ts-rs` bindings are
 checked into `src/bindings`.
+
+## Integrated Analyzer UI
+
+`AnalyzerWorkspace` is now the main application workspace rather than an unused
+parallel implementation. It reads only bounded pages, extension aggregates, and
+treemap slices. Direct folder navigation is non-recursive; typed search is an
+explicit recursive scoped query. Changing scope, search, or sort cancels the old
+query ID. Rows are virtualized and load the next cursor near the visible tail.
+
+Breadcrumbs, back/forward history, row selection, and treemap selection share one
+scope and selection state. The selected item becomes a visible trusted AgentDock
+attachment. Copy path and Reveal in Explorer operate on that exact selected row.
+The top Candidates value comes from the bounded deterministic policy aggregate
+rather than constructing a full cleanup plan during first view.
+
+The Plan tab also works without Ollama. An optional GB target invokes
+`build_cleanup_plan`; candidates remain preselected, review potential remains
+separate, and checkboxes use `edit_cleanup_plan`. The session plan is not cleared
+when a model is verified or the AI workflow changes.
+
+Browser layout QA passed at `1440x900` and `1038x663` without overlap, including
+the narrowed four-column analyzer and offline Plan controls. Focused component and
+treemap tests cover query semantics, drill-down, recursive search, paging,
+selection handoff, Explorer reveal, offline plan creation/editing, and bounded
+canvas layout. Native visual QA against a completed real MFT scan remains open
+because the Computer Use native transport was unavailable.
 
 ## Ownership
 
@@ -114,5 +145,6 @@ entry product target.
   extracted-sidecar hash validation, and release GUI launch pass. Computer Use's
   native transport was unavailable for the final packaged-window repetition, so
   that visual/UAC recording remains item 5 evidence rather than an item 2 defect.
-- Complete the analyzer UI slices in implementation-order item 3. Existing bounded
-  commands already back the first view and local-agent tools.
+- Repeat the integrated analyzer and offline Plan workflow in the native window
+  against a completed real MFT scan; browser layout and component behavior already
+  pass.

@@ -132,9 +132,13 @@ export interface ModelHarnessResult {
 
 export type AgentToolName =
   | "get_storage_overview"
-  | "query_storage_items"
+  | "list_folder_children"
+  | "list_largest_items"
+  | "search_storage"
+  | "inspect_folder"
+  | "list_cleanup_opportunities"
   | "summarize_storage"
-  | "get_item_evidence"
+  | "inspect_item"
   | "inspect_log_excerpt"
   | "build_cleanup_plan"
   | "edit_cleanup_plan"
@@ -162,6 +166,8 @@ export interface AgentActivity {
 export type AgentResultComponent =
   | "StorageOverviewResult"
   | "ItemListResult"
+  | "FolderInspectionResult"
+  | "CleanupOpportunitiesResult"
   | "AggregateResult"
   | "OwnershipEvidenceResult"
   | "LogExcerptApproval"
