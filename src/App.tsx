@@ -19,6 +19,8 @@ import {
   Search,
   ShieldCheck,
   Square,
+  Trash2,
+  FolderInput,
 } from "lucide-react";
 import type { ItemPage } from "./bindings/ItemPage";
 import type { ItemQuery } from "./bindings/ItemQuery";
@@ -116,6 +118,66 @@ function App() {
       setTreemapNodes([]);
     });
   }, [summary, currentTreemapScope]);
+
+  const [tableScopePath, setTableScopePath] = useState<Array<{ id: string | null; name: string }>>([
+    { id: null, name: "Root" },
+  ]);
+  const [deleteConfirmItem, setDeleteConfirmItem] = useState<ItemRow | null>(null);
+  const [isDeleting, setIsDeleting] = useState<boolean>(false);
+  const [deleteNotice, setDeleteNotice] = useState<string | null>(null);
+
+  const currentTableParentId = tableScopePath[tableScopePath.length - 1]?.id ?? null;
+
+  useEffect(() => {
+    if (!summary || !desktopRuntime) return;
+    const query: ItemQuery = {
+      parent_id: currentTableParentId,
+      sort: "allocated",
+      direction: "desc",
+      cursor: null,
+      limit: 150,
+    };
+    void invoke<ItemPage>("query_items", {
+      sessionId: summary.session_id,
+      query,
+    }).then((page) => {
+      setItems(page.items);
+    }).catch(() => {});
+  }, [summary, currentTableParentId]);
+
+  const handleTableNavigateUp = () => {
+    if (tableScopePath.length > 1) {
+      setTableScopePath((current) => current.slice(0, current.length - 1));
+    }
+  };
+
+  const handleOpenSubfolder = (item: ItemRow) => {
+    if (item.kind === "directory" || item.kind === "reparse_point") {
+      setTableScopePath((current) => [...current, { id: item.id, name: item.name }]);
+    }
+  };
+
+  const handleDeleteItem = async (item: ItemRow) => {
+    if (!desktopRuntime) {
+      setItems((prev) => prev.filter((i) => i.id !== item.id));
+      setDeleteConfirmItem(null);
+      return;
+    }
+    setIsDeleting(true);
+    try {
+      await invoke<boolean>("delete_file_item", { path: item.display_path });
+      setItems((prev) => prev.filter((i) => i.id !== item.id));
+      if (selectedItem?.id === item.id) setSelectedItem(null);
+      setDeleteNotice(`Successfully deleted ${item.name}`);
+      setTimeout(() => setDeleteNotice(null), 3500);
+    } catch (err) {
+      setDeleteNotice(`Failed to delete: ${String(err)}`);
+      setTimeout(() => setDeleteNotice(null), 5000);
+    } finally {
+      setIsDeleting(false);
+      setDeleteConfirmItem(null);
+    }
+  };
 
   const handleTreemapNavigateUp = () => {
     if (treemapScopePath.length > 1) {
@@ -314,24 +376,54 @@ function App() {
 
       <section className="workspace">
         <div className="analyzer-pane">
-          <div className="analyzer-toolbar">
-            <div className="breadcrumb" aria-label="Current location">
-              <HardDrive size={15} />
-              <span>{selectedTarget?.display_path ?? "Computer"}</span>
-              <ChevronRight size={14} />
+          <div className="analyzer-toolbar flex flex-wrap items-center justify-between gap-2 p-2 bg-[#181818] border-b border-[#2d2d2d]">
+            <div className="breadcrumb flex items-center gap-1 text-xs text-[#cccccc]" aria-label="Current directory location">
+              {tableScopePath.length > 1 && (
+                <button
+                  type="button"
+                  className="p-1 hover:bg-[#2a2a2a] rounded text-[#8ce1cb] transition-colors"
+                  title="Navigate up to parent directory"
+                  onClick={handleTableNavigateUp}
+                >
+                  <ChevronLeft size={14} />
+                </button>
+              )}
+              <HardDrive size={14} className="text-[#8ce1cb]" />
+              <span className="font-medium">{selectedTarget?.display_path ?? "Computer"}</span>
+              {tableScopePath.slice(1).map((crumb, idx) => (
+                <span key={crumb.id ?? idx} className="flex items-center gap-1">
+                  <ChevronRight size={12} className="text-[#666666]" />
+                  <button
+                    type="button"
+                    onClick={() => setTableScopePath((prev) => prev.slice(0, idx + 2))}
+                    className="hover:text-[#8ce1cb] hover:underline transition-colors cursor-pointer"
+                  >
+                    {crumb.name}
+                  </button>
+                </span>
+              ))}
             </div>
-            <label className="search-control">
-              <Search size={15} />
-              <input
-                aria-label="Search storage items"
-                placeholder="Filter visible items"
-                value={searchQuery}
-                onChange={(event) => setSearchQuery(event.target.value)}
-              />
-            </label>
-            <div className="segmented-control" aria-label="Size metric">
-              <button type="button" aria-pressed={metric === "allocated"} className={metric === "allocated" ? "active" : ""} onClick={() => setMetric("allocated")}>Allocated</button>
-              <button type="button" aria-pressed={metric === "logical"} className={metric === "logical" ? "active" : ""} onClick={() => setMetric("logical")}>Logical</button>
+
+            {deleteNotice && (
+              <div className="text-[11px] px-2.5 py-1 rounded bg-[#25382e] text-[#a8f0d0] border border-[#3b5947] animate-pulse">
+                {deleteNotice}
+              </div>
+            )}
+
+            <div className="flex items-center gap-2">
+              <label className="search-control">
+                <Search size={15} />
+                <input
+                  aria-label="Search storage items"
+                  placeholder="Filter visible items"
+                  value={searchQuery}
+                  onChange={(event) => setSearchQuery(event.target.value)}
+                />
+              </label>
+              <div className="segmented-control" aria-label="Size metric">
+                <button type="button" aria-pressed={metric === "allocated"} className={metric === "allocated" ? "active" : ""} onClick={() => setMetric("allocated")}>Allocated</button>
+                <button type="button" aria-pressed={metric === "logical"} className={metric === "logical" ? "active" : ""} onClick={() => setMetric("logical")}>Logical</button>
+              </div>
             </div>
           </div>
 
@@ -339,17 +431,18 @@ function App() {
             <section className="table-panel" aria-label="Storage hierarchy">
               <div className="table-header table-row">
                 <span className="name-cell"><Columns3 size={14} /> Name</span>
-                <span>{metricLabel}</span><span>Percent</span><span>Modified</span><span>Policy</span>
+                <span>{metricLabel}</span><span>Percent</span><span>Modified</span><span>Action</span>
               </div>
               <div className="empty-table">
                 {visibleItems.length > 0 ? visibleItems.map((item) => (
                   <div
-                    className={`table-row data-row ${selectedItem?.id === item.id ? "selected" : ""}`}
+                    className={`table-row data-row group ${selectedItem?.id === item.id ? "selected" : ""}`}
                     key={item.id}
                     role="button"
                     tabIndex={0}
                     aria-pressed={selectedItem?.id === item.id}
                     onClick={() => setSelectedItem((current) => current?.id === item.id ? null : item)}
+                    onDoubleClick={() => handleOpenSubfolder(item)}
                     onMouseEnter={(event) => {
                       setHoveredItem(item);
                       setHoverAnchor(event.currentTarget.getBoundingClientRect());
@@ -361,13 +454,27 @@ function App() {
                     onKeyDown={(event) => {
                       if (event.key === "Enter" || event.key === " ") {
                         event.preventDefault();
-                        setSelectedItem((current) => current?.id === item.id ? null : item);
+                        if (item.kind === "directory") {
+                          handleOpenSubfolder(item);
+                        } else {
+                          setSelectedItem((current) => current?.id === item.id ? null : item);
+                        }
                       }
                     }}
                   >
-                    <span className="name-cell item-name" title={item.display_path}>
-                      {item.kind === "directory" ? <Folder size={15} /> : item.kind === "reparse_point" ? <Link2 size={15} /> : <File size={15} />}
-                      <span>{item.name}</span>
+                    <span className="name-cell item-name" title={`${item.display_path} (Double-click to open)`}>
+                      {item.kind === "directory" ? <Folder size={15} className="text-[#e3b341]" /> : item.kind === "reparse_point" ? <Link2 size={15} className="text-[#8ce1cb]" /> : <File size={15} className="text-[#a0a5aa]" />}
+                      <span className="truncate">{item.name}</span>
+                      {item.kind === "directory" && (
+                        <button
+                          type="button"
+                          onClick={(e) => { e.stopPropagation(); handleOpenSubfolder(item); }}
+                          className="opacity-0 group-hover:opacity-100 p-0.5 hover:bg-[#333333] text-[#8ce1cb] rounded transition-opacity"
+                          title="Open subfolder"
+                        >
+                          <FolderInput size={13} />
+                        </button>
+                      )}
                     </span>
                     <span>{formatBytes(metric === "allocated" ? item.allocated_bytes : item.logical_bytes)}</span>
                     <span className="percent-cell">
@@ -375,7 +482,19 @@ function App() {
                       <span>{formatPercent(item, summary, metric)}</span>
                     </span>
                     <span>{formatModified(item.modified_at_ms)}</span>
-                    <span className="policy-pending">Pending</span>
+                    <span className="flex items-center gap-1">
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setDeleteConfirmItem(item);
+                        }}
+                        className="p-1 hover:bg-[#4a1c1d] hover:text-[#ff8080] text-[#888888] rounded transition-colors"
+                        title={`Delete ${item.kind === "directory" ? "folder" : "file"}`}
+                      >
+                        <Trash2 size={13} />
+                      </button>
+                    </span>
                   </div>
                 )) : emptyRows.map((row) => (
                   <div className="table-row skeleton-row" key={row} aria-hidden="true">
@@ -473,6 +592,40 @@ function App() {
           />
         </Suspense>
       </section>
+      {deleteConfirmItem && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4">
+          <div className="bg-[#1c221e] border border-[#3b4c42] rounded-lg shadow-2xl p-5 max-w-md w-full flex flex-col gap-4 text-xs text-[#e0ede6]">
+            <div className="flex items-center gap-2 text-[#ff8080] font-semibold text-sm">
+              <Trash2 size={18} />
+              <span>Confirm Permanent Deletion</span>
+            </div>
+            <p className="text-[#a0b3a8] leading-relaxed">
+              Are you sure you want to delete <strong className="text-white">{deleteConfirmItem.name}</strong>?
+            </p>
+            <div className="bg-[#121614] p-2.5 rounded border border-[#26332c] font-mono text-[11px] text-[#8ce1cb] truncate">
+              Path: {deleteConfirmItem.display_path}
+            </div>
+            <div className="flex items-center justify-end gap-2 mt-2">
+              <button
+                type="button"
+                disabled={isDeleting}
+                onClick={() => setDeleteConfirmItem(null)}
+                className="px-3 py-1.5 rounded bg-[#27332c] hover:bg-[#34443b] text-[#c5dbd0] transition-colors cursor-pointer disabled:opacity-50"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                disabled={isDeleting}
+                onClick={() => handleDeleteItem(deleteConfirmItem)}
+                className="px-3 py-1.5 rounded bg-[#b91c1c] hover:bg-[#dc2626] text-white font-medium transition-colors cursor-pointer flex items-center gap-1.5 disabled:opacity-50"
+              >
+                {isDeleting ? "Deleting..." : "Delete Item"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </main>
   );
 }

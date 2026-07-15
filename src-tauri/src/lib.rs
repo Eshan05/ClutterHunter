@@ -22,6 +22,7 @@ pub fn run() {
             commands::edit_cleanup_plan,
             commands::set_path_protection,
             commands::dismiss_suggestion,
+            commands::delete_file_item,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

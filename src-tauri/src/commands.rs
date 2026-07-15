@@ -638,6 +638,20 @@ pub fn dismiss_suggestion(
     Ok(dismissed)
 }
 
+#[tauri::command]
+pub fn delete_file_item(path: String) -> Result<bool, String> {
+    let target = Path::new(&path);
+    if !target.exists() {
+        return Err(format!("File or folder does not exist: {}", path));
+    }
+    if target.is_dir() {
+        std::fs::remove_dir_all(target).map_err(|error| format!("Failed to delete directory {}: {}", path, error))?;
+    } else {
+        std::fs::remove_file(target).map_err(|error| format!("Failed to delete file {}: {}", path, error))?;
+    }
+    Ok(true)
+}
+
 fn completed_output(
     state: &ScannerState,
     session_id: &str,
