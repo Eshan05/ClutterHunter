@@ -1,6 +1,7 @@
 import { lazy, Suspense, useEffect, useMemo, useState } from "react";
 import { Channel, invoke, isTauri } from "@tauri-apps/api/core";
 import {
+  ChevronLeft,
   ChevronRight,
   CircleGauge,
   Columns3,
@@ -27,7 +28,10 @@ import type { ScanProgress } from "./bindings/ScanProgress";
 import type { ScanRequest } from "./bindings/ScanRequest";
 import type { ScanSummary } from "./bindings/ScanSummary";
 import type { ScanTarget } from "./bindings/ScanTarget";
+import type { TreemapNode } from "./bindings/TreemapNode";
+import type { TreemapSlice } from "./bindings/TreemapSlice";
 import { HoverAIInsightCard } from "./analyzer/HoverAIInsightCard";
+import { TreemapCanvas } from "./analyzer/TreemapCanvas";
 import "./App.css";
 
 type Metric = "allocated" | "logical";
@@ -47,6 +51,32 @@ const browserTarget: ScanTarget = {
 };
 const emptyRows = Array.from({ length: 7 }, (_, index) => index);
 
+function treemapNodeToItemRow(node: TreemapNode): ItemRow {
+  return {
+    id: node.id,
+    parent_id: node.parent_id,
+    name: node.name,
+    display_path: node.name,
+    kind: node.kind,
+    logical_bytes: node.allocated_bytes,
+    allocated_bytes: node.allocated_bytes,
+    modified_at_ms: null,
+    extension: node.name.includes(".") ? node.name.split(".").pop() ?? null : null,
+    attributes: [],
+    hard_link_count: null,
+    child_count: null,
+    owner: null,
+    policy: {
+      tier: node.policy_tier,
+      rule_id: "treemap_slice",
+      rule_version: "1.0",
+      facts: [],
+      inference: [],
+      warnings: [],
+    },
+  };
+}
+
 function App() {
   const [targets, setTargets] = useState<ScanTarget[]>([browserTarget]);
   const [selectedTargetId, setSelectedTargetId] = useState(browserTarget.id);
@@ -64,6 +94,34 @@ function App() {
   const [scanError, setScanError] = useState<ScanFailure | null>(null);
   const [searchQuery, setSearchQuery] = useState("");
   const [useTraversalFallback, setUseTraversalFallback] = useState(false);
+
+  const [treemapNodes, setTreemapNodes] = useState<TreemapNode[]>([]);
+  const [treemapScopePath, setTreemapScopePath] = useState<Array<{ id: string | null; name: string }>>([
+    { id: null, name: "Root" },
+  ]);
+
+  const currentTreemapScope = treemapScopePath[treemapScopePath.length - 1]?.id ?? null;
+
+  useEffect(() => {
+    if (!summary || !desktopRuntime) {
+      setTreemapNodes([]);
+      return;
+    }
+    void invoke<TreemapSlice>("get_treemap_slice", {
+      sessionId: summary.session_id,
+      query: { scope_id: currentTreemapScope, max_nodes: 35 },
+    }).then((slice) => {
+      setTreemapNodes(slice.nodes);
+    }).catch(() => {
+      setTreemapNodes([]);
+    });
+  }, [summary, currentTreemapScope]);
+
+  const handleTreemapNavigateUp = () => {
+    if (treemapScopePath.length > 1) {
+      setTreemapScopePath((current) => current.slice(0, current.length - 1));
+    }
+  };
 
   useEffect(() => {
     window.localStorage.setItem("clutterhunter:dock-open", String(dockOpen));
@@ -353,12 +411,54 @@ function App() {
             </aside>
 
             <section className="treemap-panel" aria-label="Storage treemap">
-              <div className="panel-title"><span>Treemap</span><span className="metric-caption">{metricLabel} size</span></div>
-              <div className="treemap-empty" aria-hidden="true">
-                <span className="treemap-block block-a" /><span className="treemap-block block-b" />
-                <span className="treemap-block block-c" /><span className="treemap-block block-d" /><span className="treemap-block block-e" />
+              <div className="panel-title">
+                <div className="breadcrumb" aria-label="Treemap location">
+                  {treemapScopePath.length > 1 && (
+                    <button
+                      type="button"
+                      className="icon-button compact"
+                      title="Navigate up to parent directory"
+                      onClick={handleTreemapNavigateUp}
+                      style={{ width: 22, height: 22, padding: 0, marginRight: 4 }}
+                    >
+                      <ChevronLeft size={14} />
+                    </button>
+                  )}
+                  <span>{treemapScopePath.map((s) => s.name).join(" / ")}</span>
+                </div>
+                <span className="metric-caption">{metricLabel} size</span>
               </div>
-              <div className="treemap-status"><FolderOpen size={19} /><span>{summary ? "Bounded treemap query is the next analyzer slice" : "No indexed allocation"}</span></div>
+              {treemapNodes.length > 0 ? (
+                <TreemapCanvas
+                  nodes={treemapNodes}
+                  selectedId={selectedItem?.id ?? null}
+                  onSelect={(node) => setSelectedItem(treemapNodeToItemRow(node))}
+                  onOpen={(node) => {
+                    if (node.kind === "directory" && !node.synthetic) {
+                      setTreemapScopePath((current) => [...current, { id: node.id, name: node.name }]);
+                    }
+                  }}
+                  onHoverItem={(node, rect) => {
+                    setHoveredItem(node ? treemapNodeToItemRow(node) : null);
+                    setHoverAnchor(rect);
+                  }}
+                  formatBytes={formatBytes}
+                />
+              ) : (
+                <>
+                  <div className="treemap-empty" aria-hidden="true">
+                    <span className="treemap-block block-a" />
+                    <span className="treemap-block block-b" />
+                    <span className="treemap-block block-c" />
+                    <span className="treemap-block block-d" />
+                    <span className="treemap-block block-e" />
+                  </div>
+                  <div className="treemap-status">
+                    <FolderOpen size={19} />
+                    <span>{summary ? "Loading interactive treemap..." : "Run a scan to view Treemap"}</span>
+                  </div>
+                </>
+              )}
             </section>
           </div>
         </div>
