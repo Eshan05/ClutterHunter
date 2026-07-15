@@ -2,7 +2,6 @@ import React, { useEffect, useState } from "react";
 import {
   File,
   Folder,
-  HardDrive,
   Info,
   Link2,
   LoaderCircle,

@@ -78,8 +78,8 @@ export function getDeterministicInsight(item: ItemRow): string {
   if (tier === "review_required") {
     return "Review Required Tier. Item may belong to user data or application state; verify before cleanup.";
   }
-  if (tier === "user_cleanable") {
-    return "User Cleanable Tier. Identified as non-essential data candidate suitable for space reclamation.";
+  if (tier === "cleanup_candidate") {
+    return "Cleanup Candidate Tier. Identified as non-essential data candidate suitable for space reclamation.";
   }
 
   if (item.kind === "directory") {
