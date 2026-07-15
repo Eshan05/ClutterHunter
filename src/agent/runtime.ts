@@ -629,7 +629,7 @@ const agentInstructions = [
   "Protected and review-required policy tiers are deterministic and cannot be weakened.",
   "Cleanup plans are proposals only; no delete, move, recycle, uninstall, shell, web, or arbitrary file action exists.",
   "Do not retry a denied approval. Keep conservative and review-potential totals separate.",
-  "Use few tools: usually one to three. Do not reproduce tool data as a Markdown table; the UI renders deterministic result cards. Keep prose concise.",
+  "Use few tools: usually one to three. Never output large Markdown text blocks, long prose or Markdown tables. The UI handles cards. Keep text responses to a 1-2 sentence maximum summary.",
 ].join(" ");
 
 function createSingleToolRepair(model: LanguageModel): ToolCallRepairFunction<AnalyzerTools> {

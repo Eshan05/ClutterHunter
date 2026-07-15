@@ -27,6 +27,7 @@ import type { ScanProgress } from "./bindings/ScanProgress";
 import type { ScanRequest } from "./bindings/ScanRequest";
 import type { ScanSummary } from "./bindings/ScanSummary";
 import type { ScanTarget } from "./bindings/ScanTarget";
+import { HoverAIInsightCard } from "./analyzer/HoverAIInsightCard";
 import "./App.css";
 
 type Metric = "allocated" | "logical";
@@ -58,6 +59,8 @@ function App() {
   const [summary, setSummary] = useState<ScanSummary | null>(null);
   const [items, setItems] = useState<ItemRow[]>([]);
   const [selectedItem, setSelectedItem] = useState<ItemRow | null>(null);
+  const [hoveredItem, setHoveredItem] = useState<ItemRow | null>(null);
+  const [hoverAnchor, setHoverAnchor] = useState<DOMRect | null>(null);
   const [scanError, setScanError] = useState<ScanFailure | null>(null);
   const [searchQuery, setSearchQuery] = useState("");
   const [useTraversalFallback, setUseTraversalFallback] = useState(false);
@@ -289,6 +292,14 @@ function App() {
                     tabIndex={0}
                     aria-pressed={selectedItem?.id === item.id}
                     onClick={() => setSelectedItem((current) => current?.id === item.id ? null : item)}
+                    onMouseEnter={(event) => {
+                      setHoveredItem(item);
+                      setHoverAnchor(event.currentTarget.getBoundingClientRect());
+                    }}
+                    onMouseLeave={() => {
+                      setHoveredItem(null);
+                      setHoverAnchor(null);
+                    }}
                     onKeyDown={(event) => {
                       if (event.key === "Enter" || event.key === " ") {
                         event.preventDefault();
@@ -323,6 +334,14 @@ function App() {
                   </div>
                 )}
               </div>
+
+              {hoveredItem && (
+                <HoverAIInsightCard
+                  item={hoveredItem}
+                  anchorRect={hoverAnchor}
+                  selectedModelName={window.localStorage.getItem("clutterhunter:ollama-model") ?? undefined}
+                />
+              )}
             </section>
 
             <aside className="extension-panel" aria-label="Extension summary">
