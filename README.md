@@ -219,6 +219,7 @@ cache state, and installed software.
 ## Project Documentation
 
 - [Architecture guide](ARCHITECTURE.md)
+- [Technical report, local AI verification, evaluation, and privacy](TECHNICAL_REPORT.md)
 - [Product specification](docs/ProductPlan.md)
 - [Scanner architecture and measurements](docs/ScannerSpike.md)
 - [Analyzer, policy, and planner notes](docs/AnalyzerCore.md)
