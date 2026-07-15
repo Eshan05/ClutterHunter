@@ -20,7 +20,15 @@ test("completes a fast scan and keeps the analyzer bounded and linked", async ({
   const users = hierarchy.locator(".data-row", { hasText: "Users" });
   await expect(users).toBeVisible();
   await expect(page.getByLabel("Extension summary").getByText(".zip")).toBeVisible();
-  await expect(page.getByLabel("Storage treemap", { exact: true })).toBeVisible();
+  const treemap = page.getByLabel("Storage treemap", { exact: true });
+  await expect(treemap).toBeVisible();
+  await expect(page.locator(".treemap-scope-title")).toContainText("C:\\");
+  const treemapBounds = await treemap.locator("svg").boundingBox();
+  expect(treemapBounds).not.toBeNull();
+  await page.mouse.move(treemapBounds!.x + 20, treemapBounds!.y + 20);
+  await expect(page.locator(".treemap-tooltip")).toBeVisible();
+  await expect(treemap.locator(".treemap-hover-readout.active")).toBeVisible();
+  await expect(treemap.locator(".treemap-hover-readout")).not.toContainText("Current scope");
 
   expect(await hierarchy.locator(".data-row").count()).toBeLessThan(45);
   await users.click();

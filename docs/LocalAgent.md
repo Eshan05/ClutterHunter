@@ -104,6 +104,14 @@ The language model is not a correctness dependency for these frequent facts. Oth
 still force an evidence tool; if the model skips it, generated paths and sizes
 are discarded and a visible tool diagnostic is returned.
 
+Ordinary cleanup wording such as "what should I delete?" and "which folders can I
+remove?" routes to `list_cleanup_opportunities`. Size only ranks items already
+made eligible by deterministic policy evidence; it never makes an item safe to
+remove. After the required evidence call, unrelated storage tools are disabled
+for that turn so a later speculative query cannot replace the cleanup result.
+Cleanup cards and deterministic fallback text surface the policy reason and any
+warning beside each candidate. The model's role is explanation, not eligibility.
+
 Only recent user/assistant text is retained, bounded to 12 messages and 24,000
 characters. Older local conversation text is reduced into a deterministic
 2,400-character session summary; tool history is not replayed. Raw thinking is
@@ -137,9 +145,10 @@ reparse points, and returns bounded beginning/end excerpts. Limits are five file
   images and generated links are inert so Markdown cannot bypass local privacy.
   Tool activity shows purpose, state, result count, elapsed time, and truncation
   without exposing raw thinking.
-- Factual prompts are routed to a required first evidence tool. Item, aggregate,
-  and overview values are formatted from deterministic envelopes rather than
-  model prose. Query context echoes scope, metric, direction, kinds, and limit.
+- Factual prompts are routed to one required intent-matched evidence tool, then
+  unrelated tools are closed for that turn. Item, aggregate, overview, and
+  cleanup values are formatted from deterministic envelopes rather than model
+  prose. Query context echoes scope, metric, direction, kinds, and limit.
 - The last exact resolved scope survives ambiguous follow-ups. A model-invented
   root scope is rejected unless the user explicitly asks for the scan/drive root.
 - Cancellation aborts the active stream. Cancelling an approval continuation also

@@ -62,6 +62,10 @@ Existing capability that should be used rather than rebuilt:
   composition, coverage, and warnings in one bounded result.
 - [x] Added `list_cleanup_opportunities`: deterministic candidate/review evidence
   without creating or replacing the user's Plan.
+- [x] Route ordinary delete/remove phrasing to cleanup evidence, rank only
+  policy-eligible opportunities by size, and surface each deterministic reason.
+- [x] Close unrelated tools after the required evidence call so a speculative
+  second call cannot replace the authoritative cleanup result.
 - [x] Added recursive `list_largest_items` without requiring fake search text or
   sorting every matching descendant.
 - [x] Extended `inspect_folder` with largest recursive files and top extensions.

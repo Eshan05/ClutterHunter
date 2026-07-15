@@ -145,7 +145,7 @@ describe("agent analyzer tools", () => {
       data: {
         conservative_bytes: "100",
         review_potential_bytes: "900",
-        items: [{ display_path: "C:\\Temp\\Cache", tier: "cleanup_candidate" }],
+        items: [{ display_path: "C:\\Temp\\Cache", tier: "cleanup_candidate", reason: "Known cache root" }],
       },
     });
   });

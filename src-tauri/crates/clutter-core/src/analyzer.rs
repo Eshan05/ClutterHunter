@@ -763,33 +763,89 @@ impl AnalyzerIndex {
             .map(|id| arena.parse_node_id(id))
             .transpose()?
             .unwrap_or(0);
-        let children =
-            self.sorted_children(arena, scope, ItemSort::Allocated, SortDirection::Desc)?;
         let limit = usize::from(query.max_nodes.clamp(1, 5_000));
-        let visible = limit.min(children.len());
-        let hidden = &children[visible..];
-        let other_allocated = hidden.iter().fold(0u64, |total, index| {
-            total.saturating_add(arena.node(*index).map_or(0, |node| node.allocated_bytes))
-        });
-        let mut nodes: Vec<_> = children[..visible]
-            .iter()
-            .map(|index| self.treemap_node(arena, *index, Some(scope)))
-            .collect();
-        if other_allocated > 0 {
-            nodes.push(TreemapNode {
-                id: format!("{}:other:{scope}", arena.session_id()),
-                parent_id: Some(arena.node_id(scope)),
-                name: "Other".to_owned(),
-                allocated_bytes: other_allocated.to_string(),
-                kind: ItemKind::Directory,
-                policy_tier: PolicyTier::Protected,
-                owner_id: None,
-                synthetic: true,
-            });
+        let candidate_limit = limit.saturating_mul(4).min(20_000);
+        let mut largest =
+            BinaryHeap::<Reverse<(u64, Reverse<u32>)>>::with_capacity(candidate_limit + 1);
+        let mut total_allocated = 0u64;
+        let mut stack = Vec::new();
+        if let Some(scope_node) = arena.node(scope) {
+            let mut child = scope_node.first_child;
+            while child != NO_INDEX {
+                stack.push(child);
+                child = arena.node(child).map_or(NO_INDEX, |node| node.next_sibling);
+            }
         }
+        while let Some(index) = stack.pop() {
+            let Some(node) = arena.node(index) else {
+                continue;
+            };
+            if node.is_directory() {
+                let mut child = node.first_child;
+                while child != NO_INDEX {
+                    stack.push(child);
+                    child = arena.node(child).map_or(NO_INDEX, |node| node.next_sibling);
+                }
+            } else if node.allocated_bytes > 0 {
+                total_allocated = total_allocated.saturating_add(node.allocated_bytes);
+                largest.push(Reverse((node.allocated_bytes, Reverse(index))));
+                if largest.len() > candidate_limit {
+                    largest.pop();
+                }
+            }
+        }
+
+        let mut candidates: Vec<_> = largest
+            .into_iter()
+            .map(|Reverse((bytes, Reverse(index)))| (index, bytes))
+            .collect();
+        candidates.sort_unstable_by(|left, right| {
+            right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0))
+        });
+
+        let mut included = HashSet::with_capacity(limit);
+        let mut ordered = Vec::with_capacity(limit);
+        let mut represented_leaf_bytes = 0u64;
+        for (leaf, bytes) in candidates {
+            if ordered.len() == limit {
+                break;
+            }
+            let mut chain = Vec::new();
+            let mut cursor = leaf;
+            while cursor != scope && cursor != NO_INDEX {
+                chain.push(cursor);
+                cursor = arena.node(cursor).map_or(NO_INDEX, |node| node.parent);
+            }
+            if cursor != scope {
+                continue;
+            }
+            for index in chain.into_iter().rev() {
+                if included.insert(index) {
+                    ordered.push(index);
+                    if ordered.len() == limit {
+                        break;
+                    }
+                }
+            }
+            if included.contains(&leaf) {
+                represented_leaf_bytes = represented_leaf_bytes.saturating_add(bytes);
+            }
+        }
+
+        let nodes = ordered
+            .into_iter()
+            .map(|index| {
+                let parent = arena
+                    .node(index)
+                    .map(|node| node.parent)
+                    .filter(|parent| *parent != NO_INDEX);
+                self.treemap_node(arena, index, parent)
+            })
+            .collect();
+        let other_allocated = total_allocated.saturating_sub(represented_leaf_bytes);
         Ok(TreemapSlice {
             nodes,
-            truncated: visible < children.len(),
+            truncated: other_allocated > 0,
             other_allocated_bytes: other_allocated.to_string(),
         })
     }
@@ -2130,11 +2186,31 @@ mod tests {
             &arena,
             &TreemapQuery {
                 scope_id: None,
-                max_nodes: 1,
+                max_nodes: 4,
             },
         )?;
         assert!(treemap.truncated);
-        assert_eq!(treemap.nodes.len(), 2);
+        assert!(treemap.nodes.len() <= 4);
+        assert!(treemap.nodes.iter().any(|node| node.name == "package.bin"));
+        assert!(treemap.nodes.iter().any(|node| node.name == "node_modules"));
+        assert!(
+            treemap
+                .nodes
+                .iter()
+                .all(|node| !node.synthetic && node.parent_id.is_some())
+        );
+
+        let complete = analyzer.treemap(
+            &arena,
+            &TreemapQuery {
+                scope_id: None,
+                max_nodes: 32,
+            },
+        )?;
+        assert!(!complete.truncated);
+        assert_eq!(complete.other_allocated_bytes, "0");
+        assert!(complete.nodes.iter().any(|node| node.name == "data.bin"));
+        assert!(complete.nodes.iter().any(|node| node.name == "photo.jpg"));
         Ok(())
     }
 

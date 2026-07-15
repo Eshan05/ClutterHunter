@@ -10,6 +10,7 @@
     "tauri": "tauri"
   },
   "dependencies": {
+    "@nivo/treemap": "0.99.0",
     "@tanstack/react-virtual": "3.14.6",
     "@tauri-apps/api": "^2.11.1",
     "@tauri-apps/plugin-http": "2.5.9",

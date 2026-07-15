@@ -148,6 +148,9 @@ describe("deterministic evidence routing", () => {
     expect(evidenceToolForPrompt("Can I remove AppData?", "investigate")).toBe("inspect_item");
     expect(evidenceToolForPrompt("Why is this folder so large?", "investigate")).toBe("inspect_folder");
     expect(evidenceToolForPrompt("What can I safely remove?", "investigate")).toBe("list_cleanup_opportunities");
+    expect(evidenceToolForPrompt("What should I delete?", "investigate")).toBe("list_cleanup_opportunities");
+    expect(evidenceToolForPrompt("Which folders can I remove?", "investigate")).toBe("list_cleanup_opportunities");
+    expect(evidenceToolForPrompt("Give me deletion recommendations", "investigate")).toBe("list_cleanup_opportunities");
     expect(evidenceToolForPrompt("Largest files anywhere under Downloads?", "investigate")).toBe("list_largest_items");
     expect(evidenceToolForPrompt("Find files named archive", "investigate")).toBe("search_storage");
     expect(evidenceToolForPrompt("Hello there", "investigate")).toBeNull();

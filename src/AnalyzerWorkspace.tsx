@@ -165,7 +165,7 @@ export function AnalyzerWorkspace({
       }),
       invoke<TreemapSlice>("get_treemap_slice", {
         sessionId: summary.session_id,
-        query: { scope_id: scope.id, max_nodes: 500 },
+        query: { scope_id: scope.id, max_nodes: 2_500 },
       }),
     ]).then(([nextAggregate, nextTreemap]) => {
       if (!active) return;
@@ -314,7 +314,7 @@ export function AnalyzerWorkspace({
             <SortHeader label="Logical" active={sort === "logical"} direction={direction} onClick={() => changeSort("logical")} />
             <span>Percent</span>
             <SortHeader label="Modified" active={sort === "modified"} direction={direction} onClick={() => changeSort("modified")} />
-            <SortHeader label="Policy" active={sort === "policy"} direction={direction} onClick={() => changeSort("policy")} />
+            <SortHeader label="AI policy" active={sort === "policy"} direction={direction} onClick={() => changeSort("policy")} />
             <SortHeader label="Owner" active={sort === "owner"} direction={direction} onClick={() => changeSort("owner")} />
           </div>
           <div ref={scrollRef} className="table-scroll">
@@ -353,7 +353,12 @@ export function AnalyzerWorkspace({
                       <span>{formatPercent(item, scopeBytes, metric)}</span>
                     </span>
                     <span>{formatModified(item.modified_at_ms)}</span>
-                    <span className={`policy-tier policy-${item.policy.tier}`}>{policyLabel(item.policy.tier)}</span>
+                    <span
+                      className={`policy-tier policy-${item.policy.tier}`}
+                      title={policyTitle(item.policy.tier)}
+                    >
+                      {policyLabel(item.policy.tier)}
+                    </span>
                     <span className="owner-cell" title={item.owner?.name}>{item.owner?.name ?? "-"}</span>
                   </div>
                 );
@@ -395,10 +400,19 @@ export function AnalyzerWorkspace({
         </aside>
 
         <section className="treemap-panel" aria-label="Storage treemap panel">
-          <div className="panel-title"><span>Treemap</span><span className="metric-caption">Allocated size</span></div>
+          <div className="panel-title">
+            <span className="treemap-scope-title">
+              <span>Treemap</span>
+              <strong title={scope.displayPath}>{scope.name}</strong>
+            </span>
+            <span className="metric-caption">Allocated size</span>
+          </div>
           {treemap?.nodes.length ? (
             <TreemapCanvas
               nodes={treemap.nodes}
+              omittedAllocatedBytes={treemap.other_allocated_bytes}
+              scopeName={scope.name}
+              scopePath={scope.displayPath}
               selectedId={selectedItem?.id ?? null}
               onSelect={(node) => void resolveTreemapNode(node, false)}
               onOpen={(node) => void resolveTreemapNode(node, true)}
@@ -459,7 +473,13 @@ function failureDetail(error: unknown): string {
 }
 
 function policyLabel(tier: ItemRow["policy"]["tier"]): string {
-  return tier === "cleanup_candidate" ? "Candidate" : tier === "review_required" ? "Review" : "Protected";
+  return tier === "cleanup_candidate" ? "Suggested" : tier === "review_required" ? "Ask first" : "Not suggested";
+}
+
+function policyTitle(tier: ItemRow["policy"]["tier"]): string {
+  if (tier === "cleanup_candidate") return "AI may include this in conservative cleanup plans";
+  if (tier === "review_required") return "AI may surface this only for your review";
+  return "Excluded from AI-generated cleanup plans; this does not restrict your own actions";
 }
 
 function formatModified(value: string | null): string {

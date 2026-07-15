@@ -7,7 +7,7 @@
   - Windows 10/11 x64. Whole-volume scans support NTFS only; selected non-NTFS folders may use labeled traversal.
   - No filesystem deletion, uninstall, recycle, or modification in v1.
   - Scan index, chat, and cleanup plan remain session-only. Protected paths, model choice, harness results, and UI preferences persist locally.
-  - Safety tiers are deterministic: protected, review-required, and cleanup-candidate. The model cannot promote an item into the safe tier.
+  - Safety tiers are deterministic AI/planner policy, not user permissions: protected, review-required, and cleanup-candidate. The model cannot promote an item into the safe tier; exact user intent remains authoritative and requires a separately warned approval path in any future destructive milestone.
 
   Architecture
 

@@ -645,7 +645,11 @@ function ToolResultCard({ result }: { result: AgentToolResult<unknown> }) {
       <div className="tool-result-content">
         {rows.length > 0 ? rows.map((row, index) => (
           <div className="tool-result-row" key={`${row.label}-${index}`} title={row.title ?? row.label}>
-            <span>{row.label}</span><strong>{row.value}</strong>
+            <span className="tool-result-label">
+              <span>{row.label}</span>
+              {row.detail && <small>{row.detail}</small>}
+            </span>
+            <strong>{row.value}</strong>
           </div>
         )) : <span className="tool-result-empty">{emptyText}</span>}
       </div>
@@ -719,7 +723,8 @@ function resultRows(component: AgentToolResult<unknown>["component"], data: Reco
         const path = stringField(record, "display_path", title);
         const tier = stringField(record, "tier", "review_required").replaceAll("_", " ");
         const action = stringField(record, "action_kind", "none").replaceAll("_", " ");
-        return resultRow(`${path} · ${tier}`, stringField(record, "reclaimable_bytes", "0"), true, action === "none" ? title : `${title} · ${action}`);
+        const reason = stringField(record, "reason", "");
+        return resultRow(`${path} · ${tier}`, stringField(record, "reclaimable_bytes", "0"), true, action === "none" ? title : `${title} · ${action}`, reason);
       }),
     ];
   }
@@ -761,8 +766,8 @@ function resultRows(component: AgentToolResult<unknown>["component"], data: Reco
   return [resultRow("Error", stringField(data, "error", "Unknown tool error"))];
 }
 
-function resultRow(label: string, value: string, bytes = false, title?: string) {
-  return { label, value: bytes ? formatBytes(value) : value, title };
+function resultRow(label: string, value: string, bytes = false, title?: string, detail?: string) {
+  return { label, value: bytes ? formatBytes(value) : value, title, detail };
 }
 
 function gibibytesToBytes(value: string): string | null {

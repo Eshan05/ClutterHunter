@@ -162,7 +162,7 @@ export function createAnalyzerTools(dependencies: AnalyzerToolDependencies) {
     }),
 
     list_cleanup_opportunities: tool({
-      description: "List deterministic cleanup candidates and optional review opportunities inside one folder without creating or changing the cleanup plan.",
+      description: "List policy-backed cleanup candidates and optional review opportunities inside one folder. Size ranks eligible evidence; it never makes an arbitrary large folder safe. Does not change the cleanup plan.",
       inputSchema: z.object({
         scope: z.string().max(1_024).optional(),
         include_review: z.boolean().default(true),
@@ -198,13 +198,18 @@ export function createAnalyzerTools(dependencies: AnalyzerToolDependencies) {
           const details = nodeId
             ? await invoke<ItemDetails>("get_item_details", { sessionId, nodeId })
             : null;
+          const evidence = item.evidence.length > 0 ? item.evidence : details ? [details.evidence] : [];
+          const reason = evidence.flatMap((entry) => entry.facts).find(Boolean)
+            ?? item.warnings.find(Boolean)
+            ?? null;
           return {
             title: item.title,
             display_path: details?.item.display_path ?? null,
             category: item.category,
             tier: item.tier,
             reclaimable_bytes: item.reclaimable_bytes,
-            evidence: item.evidence.length > 0 ? item.evidence : details ? [details.evidence] : [],
+            reason,
+            evidence,
             warnings: item.warnings,
             action_kind: item.action_kind,
           };

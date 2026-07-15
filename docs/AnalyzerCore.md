@@ -25,8 +25,10 @@ Implemented commands:
 - `get_item_details`: the row plus deterministic policy evidence.
 - `get_storage_aggregate`: bounded extension, owner, policy, or kind buckets with
   explicit `Other` totals.
-- `get_treemap_slice`: at most 5,000 immediate weighted children plus a synthetic
-  deterministic `Other` node.
+- `get_treemap_slice`: at most 5,000 largest allocated file leaves plus the
+  ancestor folders needed to restore a bounded hierarchy. Omitted allocation is
+  explicit; the Canvas renderer partitions it into deterministic per-folder
+  `Other` regions without receiving the full scan tree.
 - `build_cleanup_plan` and `edit_cleanup_plan`: deterministic grouped proposals,
   separate candidate/review totals, target shortfall, edit-time node/tier
   revalidation, and a hard 500-item output limit with explicit omitted counts and
@@ -56,6 +58,12 @@ attachment. Copy path and Reveal in Explorer operate on that exact selected row.
 The top Candidates value comes from the bounded deterministic policy aggregate
 rather than constructing a full cleanup plan during first view.
 
+The treemap uses Nivo's React 19-compatible SVG hierarchy over the bounded Rust
+slice. Exact SVG hit targets drive hover tooltips, a persistent path/size readout,
+ancestor outlines, selection, and double-click drill-down. Parent and leaf names
+render when their rectangles have room; subpixel gutters replace borders on every
+leaf so dense real scans remain legible.
+
 The Plan tab also works without Ollama. An optional GB target invokes
 `build_cleanup_plan`; candidates remain preselected, review potential remains
 separate, and checkboxes use `edit_cleanup_plan`. The session plan is not cleared
@@ -65,7 +73,7 @@ Browser layout QA passed at `1440x900` and `1038x663` without overlap, including
 the narrowed four-column analyzer and offline Plan controls. Focused component and
 treemap tests cover query semantics, drill-down, recursive search, paging,
 selection handoff, Explorer reveal, offline plan creation/editing, and bounded
-canvas layout. Native visual QA against a completed real MFT scan remains open
+SVG layout and hover behavior. Native visual QA against a completed real MFT scan remains open
 because the Computer Use native transport was unavailable.
 
 ## Ownership
@@ -95,6 +103,13 @@ The bundled rule set is intentionally narrow:
 4. partial or potentially stale coverage downgrades cleanup candidates and blocks
    plan selection.
 
+These tiers are AI/planner policy, not user permissions. The analyzer now labels
+the column **AI policy** and renders protected as **Not suggested** so mixed or
+unknown directories do not appear filesystem-locked. The current read-only
+planner still excludes protected items. A future destructive milestone may turn
+an exact user-directed protected item into a separately warned, approval-bound
+action without changing its deterministic tier.
+
 Candidate grouping is subtree-safe. A directory is proposed as one opportunity
 only when every contributing descendant has the same candidate rule. A protected
 photo or source file inside a cache/temp tree is excluded rather than hidden in
@@ -113,7 +128,7 @@ The release-mode five-million-entry synthetic gate on 2026-07-14 measured:
 - policy/ownership classification: `5,784` ms;
 - first 50 results from a five-million-match bounded search: `200` ms;
 - first navigation sort: `159` ms; cached repeat: below the millisecond timer;
-- aggregate: `177` ms; bounded treemap: `73` ms; and
+- aggregate: `160` ms; bounded hierarchical treemap: `285` ms; and
 - bounded 500-item cleanup plan: `2,026` ms.
 
 These are deterministic synthetic, warm, single-run measurements, not the final

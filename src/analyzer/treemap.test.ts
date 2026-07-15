@@ -1,41 +1,51 @@
 import { describe, expect, it } from "vitest";
 import type { TreemapNode } from "../bindings/TreemapNode";
-import { layoutTreemap, treemapColor } from "./treemap";
+import { buildTreemapHierarchy, treemapColor } from "./treemap";
 
-const nodes: TreemapNode[] = [
-  node("large", "900"),
-  node("small", "100"),
-];
+describe("treemap hierarchy", () => {
+  it("restores bounded ancestors and accounts for omitted space at each level", () => {
+    const folder = node("folder", "folder", "1000", "directory", null);
+    const nested = node("nested", "nested", "700", "directory", folder.id);
+    const file = node("large.bin", "large.bin", "500", "file", nested.id);
 
-describe("treemap layout", () => {
-  it("keeps every bounded node inside the canvas", () => {
-    const rectangles = layoutTreemap(nodes, 1000, 500);
+    const root = buildTreemapHierarchy([folder, nested, file], "500");
 
-    expect(rectangles).toHaveLength(2);
-    expect(rectangles[0]!.width * rectangles[0]!.height).toBeGreaterThan(
-      rectangles[1]!.width * rectangles[1]!.height,
-    );
-    for (const rectangle of rectangles) {
-      expect(rectangle.x).toBeGreaterThanOrEqual(0);
-      expect(rectangle.y).toBeGreaterThanOrEqual(0);
-      expect(rectangle.x + rectangle.width).toBeLessThanOrEqual(1000);
-      expect(rectangle.y + rectangle.height).toBeLessThanOrEqual(500);
-    }
+    expect(root.allocatedBytes).toBe("1000");
+    expect(root.children?.map((child) => child.name)).toEqual(["folder"]);
+    const folderDatum = root.children?.[0];
+    expect(folderDatum?.relativePath).toBe("folder");
+    expect(folderDatum?.children?.[0]?.relativePath).toBe("folder\\nested");
+    expect(folderDatum?.children?.[0]?.ancestorIds).toEqual(["folder"]);
+    expect(folderDatum?.children?.map((child) => [child.name, child.allocatedBytes])).toEqual([
+      ["nested", "700"],
+      ["Other", "300"],
+    ]);
+    expect(folderDatum?.children?.[0]?.children?.map((child) => [child.name, child.allocatedBytes])).toEqual([
+      ["large.bin", "500"],
+      ["Other", "200"],
+    ]);
   });
 
-  it("is empty for unusable bounds and colors equal extensions consistently", () => {
-    expect(layoutTreemap(nodes, 0, 500)).toEqual([]);
-    expect(treemapColor(node("one.log", "10"))).toBe(treemapColor(node("two.log", "20")));
+  it("keeps same-extension file colors stable", () => {
+    expect(treemapColor(node("one.log", "one", "10"))).toBe(
+      treemapColor(node("two.log", "two", "20")),
+    );
   });
 });
 
-function node(name: string, allocatedBytes: string): TreemapNode {
+function node(
+  name: string,
+  id: string,
+  allocatedBytes: string,
+  kind: TreemapNode["kind"] = "file",
+  parentId: string | null = null,
+): TreemapNode {
   return {
-    id: name,
-    parent_id: null,
+    id,
+    parent_id: parentId,
     name,
     allocated_bytes: allocatedBytes,
-    kind: "file",
+    kind,
     policy_tier: "protected",
     owner_id: null,
     synthetic: false,

@@ -475,6 +475,11 @@ The Rust policy engine owns safety tiers. Every decision records:
 
 There is no LLM confidence score. Model prose cannot change a tier.
 
+Policy tiers constrain AI suggestions and deterministic plan generation. They are
+not filesystem permissions and never remove the user's authority over their own
+data. The UI therefore describes this field as **AI policy** rather than implying
+that ClutterHunter or Windows has locked an item.
+
 ### 7.2 Protected
 
 - Windows and operating-system directories unless a narrow reviewed rule produces
@@ -486,7 +491,11 @@ There is no LLM confidence score. Model prose cannot change a tier.
 - Backups and low-confidence classifications.
 - User-configured protected paths.
 
-Protected items remain visible in the analyzer but never enter a generated plan.
+Protected items remain visible and inspectable. They never enter a generic or
+model-initiated cleanup plan. An exact user-directed request may surface the named
+item as a separate guarded review action with a clear warning and explicit
+approval; that does not reclassify the item or make it a cleanup candidate. The
+first milestone remains read-only and cannot execute that action.
 
 ### 7.3 Review Required
 
@@ -520,7 +529,9 @@ scan coverage, or a user protection always wins over a cleanup rule.
 - Users may add persistent protected folders.
 - An agent request such as "never suggest this folder again" prepares a change
   but requires explicit approval before storage.
-- Built-in protections cannot be weakened or reordered in v1.
+- Built-in protections cannot be weakened, reordered, or silently overridden by
+  the model. Exact user-directed review is scoped to that request and does not
+  persist as a weaker policy.
 - Dismissed suggestions persist by canonical target and rule ID.
 - NTFS protections use volume identity plus normalized relative path; traversal
   targets retain a normalized absolute Windows path fallback.
@@ -831,7 +842,8 @@ Plan tab; inline cards remain a record of the conversation.
 - Radix primitives for accessible menus, dialogs, tabs, tooltips, and approvals.
 - Lucide icons for familiar commands.
 - Zustand for bounded client/UI state; the Rust session remains data authority.
-- D3 hierarchy for treemap layout and Canvas 2D for rendering.
+- Nivo TreeMap `0.99.0` for its React 19-compatible D3 hierarchy layout, bounded
+  SVG nodes, exact hover targets, and reserved nested-folder labels.
 - A proven current row virtualizer, installed at an exact reviewed version.
 - Zod schemas for AI tools and runtime validation at non-generated boundaries.
 - Vitest and React Testing Library for frontend tests; Playwright for workflows.

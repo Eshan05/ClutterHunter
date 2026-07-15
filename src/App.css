@@ -373,6 +373,9 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 }
 .panel-title svg { color: var(--accent); }
 .metric-caption { color: var(--text-faint); font-weight: 400; }
+.treemap-scope-title { display: flex; min-width: 0; align-items: center; gap: 8px; }
+.treemap-scope-title > span { flex: 0 0 auto; }
+.treemap-scope-title strong { overflow: hidden; color: var(--accent-soft); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
 .extension-empty { display: flex; align-items: flex-end; gap: 4px; height: calc(100% - 66px); padding: 16px; opacity: .38; }
 .extension-empty span { flex: 1; min-width: 8px; height: 9%; border: 1px solid #111412; }
 .extension-empty span:nth-child(2) { height: 17%; }
@@ -422,10 +425,18 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .treemap-status { position: absolute; inset: 31px 0 0; display: flex; align-items: center; justify-content: center; gap: 7px; color: #929e96; font-size: 11px; }
 .treemap-status svg { color: #a7b7ae; }
 .treemap-canvas-host { position: absolute; inset: 32px 0 0; overflow: hidden; background: #111512; }
-.treemap-canvas-host canvas { display: block; cursor: crosshair; }
-.treemap-tooltip { position: absolute; top: 8px; right: 8px; display: flex; max-width: min(260px, 60%); flex-direction: column; gap: 2px; padding: 5px 7px; border: 1px solid #536059; color: var(--text); background: #151b18e8; pointer-events: none; }
+.treemap-canvas-host svg { display: block; }
+.treemap-tooltip { display: grid; min-width: 126px; max-width: 320px; gap: 2px; padding: 6px 8px; border: 1px solid #66756d; color: #edf4f0; background: rgba(19, 24, 21, .97); box-shadow: 0 3px 10px rgba(0, 0, 0, .38); pointer-events: none; }
 .treemap-tooltip strong { overflow: hidden; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
-.treemap-tooltip span { color: var(--text-muted); font-size: 9px; }
+.treemap-tooltip span { color: #d1ddd6; font-size: 9px; }
+.treemap-tooltip small { overflow: hidden; color: #94a39b; font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+.treemap-hover-readout { position: absolute; right: 0; bottom: 0; left: 0; display: grid; grid-template-columns: 8px minmax(80px, auto) auto minmax(120px, 1fr); height: 24px; align-items: center; gap: 7px; padding: 0 8px; border-top: 1px solid #414a44; color: #dce5df; background: rgba(25, 30, 27, .94); pointer-events: none; }
+.treemap-hover-readout.active { border-top-color: #789188; background: rgba(24, 34, 30, .97); }
+.treemap-hover-readout strong, .treemap-hover-readout small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.treemap-hover-readout strong { font-size: 10px; }
+.treemap-hover-readout > span { color: #abb8b0; font-size: 9px; }
+.treemap-hover-readout small { color: #84928a; font-size: 9px; text-align: right; }
+.treemap-hover-swatch { width: 8px; height: 8px; border: 1px solid rgba(255, 255, 255, .28); }
 
 .ai-dock { display: grid; grid-template-rows: 40px minmax(0, 1fr); min-width: 0; min-height: 0; border-left: 1px solid var(--border-strong); background: #151917; }
 .dock-tabs { display: grid; grid-template-columns: 1fr 1fr; border-bottom: 1px solid var(--border-strong); background: #1c211e; }
@@ -511,6 +522,10 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .tool-result-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 8px; min-height: 25px; padding: 0 7px; border-bottom: 1px solid #2b322e; }
 .tool-result-row:last-child { border-bottom: 0; }
 .tool-result-row span { overflow: hidden; color: #adb9b1; text-overflow: ellipsis; white-space: nowrap; }
+.tool-result-label { display: flex; min-width: 0; flex-direction: column; justify-content: center; }
+.tool-result-label > span { text-overflow: ellipsis; }
+.tool-result-label > small { overflow: hidden; margin-top: 2px; color: #7f9087; font-size: 8px; text-overflow: ellipsis; white-space: nowrap; }
+.tool-result-row:has(.tool-result-label > small) { min-height: 34px; }
 .tool-result-row strong { color: #dce5df; font-size: 9px; font-weight: 650; white-space: nowrap; }
 .tool-result-empty { padding: 7px; color: var(--text-faint); font-size: 9px; }
 .result-ToolErrorResult { border-color: #764b47; }
