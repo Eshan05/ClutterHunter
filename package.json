@@ -1,0 +1,44 @@
+{
+  "name": "tauri-app",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "preview": "vite preview",
+    "tauri": "tauri"
+  },
+  "dependencies": {
+    "@nivo/treemap": "0.99.0",
+    "@tanstack/react-virtual": "3.14.6",
+    "@tauri-apps/api": "^2.11.1",
+    "@tauri-apps/plugin-http": "2.5.9",
+    "@tauri-apps/plugin-opener": "^2.5.4",
+    "ai": "7.0.26",
+    "ai-sdk-ollama": "4.0.0",
+    "clsx": "^2.1.1",
+    "d3-hierarchy": "3.1.2",
+    "lucide-react": "^1.24.0",
+    "react": "^19.2.7",
+    "react-dom": "^19.2.7",
+    "streamdown": "2.5.0",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.61.1",
+    "@tailwindcss/vite": "^4.3.2",
+    "@tauri-apps/cli": "^2.11.4",
+    "@testing-library/react": "^16.3.2",
+    "@testing-library/user-event": "^14.6.1",
+    "@types/d3-hierarchy": "3.1.7",
+    "@types/react": "^19.2.17",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^6.0.3",
+    "jsdom": "^29.1.1",
+    "tailwindcss": "^4.3.2",
+    "typescript": "~7.0.2",
+    "vite": "^8.1.4",
+    "vitest": "^4.1.10"
+  }
+}

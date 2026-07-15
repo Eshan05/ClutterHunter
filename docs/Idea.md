@@ -1,23 +1,16 @@
-## Policy Engine (As an example)
+# ClutterHunter Idea
 
-Responsible for enforcing rules such as:
-1. Never automatically deleting:
-   1. Operating-system directories
-   2. Files belonging to currently installed applications
-   3. User-created documents
-   4. Source-control working trees
-   5. Encrypted or unknown containers
-   6. The only copy of a detected backup
-   7. Anything classified with insufficient confidence
-2. Only bounded tools (Just example, not exhaustive)
-   1. `inspect_item`
-   2. `inspect_directory`
-   3. `find_duplicates`
-   4. `show_application_owner`
-   5. `estimate_recoverable_space`
-   6. `propose_cleanup`
-   7. `move_to_recycle_bin`
+ClutterHunter is a private, evidence-based storage agent for Windows. A fast
+WizTree-style analyzer builds the authoritative storage index. An on-device
+Ollama model then queries bounded tools to explain storage and refine a cleanup
+plan without receiving the full filesystem tree.
 
-## Note
+The first milestone is non-destructive. The policy engine classifies items as
+`protected`, `review-required`, or `cleanup-candidate`; the model cannot promote
+an item into a safer tier. Projects, personal files, installed applications,
+encrypted/unknown containers, backups, and low-confidence items remain protected
+or require review.
 
-NO Ring 0
+There is no Ring0 component, cloud AI, LAN model endpoint, or automatic file
+mutation. See [ProductPlan.md](ProductPlan.md) for the complete product contract,
+architecture, interfaces, and acceptance criteria.
